@@ -8,7 +8,11 @@ use crate::config::Config;
 use crate::models::Track;
 
 pub enum DownloadPhase {
-    Downloading { percent: f64, speed: String, eta: String },
+    Downloading {
+        percent: f64,
+        speed: String,
+        eta: String,
+    },
     Converting,
 }
 
@@ -134,7 +138,11 @@ impl Downloader {
                         .unwrap_or(0.0);
                     let speed = parts[1].trim().to_string();
                     let eta = parts[2].trim().to_string();
-                    on_progress(DownloadPhase::Downloading { percent, speed, eta });
+                    on_progress(DownloadPhase::Downloading {
+                        percent,
+                        speed,
+                        eta,
+                    });
                 }
             } else if line.starts_with("POSTPROCESS") {
                 on_progress(DownloadPhase::Converting);

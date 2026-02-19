@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, Row, Transaction, params};
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::models::{Playlist, PlaylistTrack, Track};
+
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 pub struct Database {
     conn: Connection,
@@ -31,39 +33,53 @@ impl Database {
     }
 
     fn init(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS tracks (
-                id TEXT PRIMARY KEY,
-                url TEXT NOT NULL UNIQUE,
-                title TEXT NOT NULL,
-                alias TEXT,
-                duration INTEGER NOT NULL,
-                added_at TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                available INTEGER NOT NULL DEFAULT 1
-            );
+        self.conn
+            .execute("PRAGMA foreign_keys = ON", [])
+            .with_context(|| "Failed to enable foreign keys")?;
 
-            CREATE TABLE IF NOT EXISTS playlists (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
-            );
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )",
+                [],
+            )
+            .with_context(|| "Failed to initialize migration tracking table")?;
 
-            CREATE TABLE IF NOT EXISTS playlist_tracks (
-                playlist_id TEXT NOT NULL,
-                track_id TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                PRIMARY KEY (playlist_id, track_id),
-                FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
-                FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-            );
+        let current_version: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })?;
 
-            CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title);
-            CREATE INDEX IF NOT EXISTS idx_tracks_alias ON tracks(alias);
-            CREATE INDEX IF NOT EXISTS idx_playlist_tracks_position ON playlist_tracks(playlist_id, position);
-            "#,
-        ).with_context(|| "Failed to initialize database schema")?;
+        match current_version {
+            None => {
+                let tx = self
+                    .conn
+                    .unchecked_transaction()
+                    .with_context(|| "Failed to start schema bootstrap transaction")?;
+                apply_migration_1(&tx)?;
+                record_migration(&tx, CURRENT_SCHEMA_VERSION)?;
+                tx.commit()
+                    .with_context(|| "Failed to commit schema bootstrap transaction")?;
+            }
+            Some(version) if version == CURRENT_SCHEMA_VERSION => {}
+            Some(version) if version > CURRENT_SCHEMA_VERSION => {
+                anyhow::bail!(
+                    "Database schema version {} is newer than supported version {}",
+                    version,
+                    CURRENT_SCHEMA_VERSION
+                );
+            }
+            Some(version) => {
+                anyhow::bail!(
+                    "Unsupported schema version {}. Only {} is currently supported.",
+                    version,
+                    CURRENT_SCHEMA_VERSION
+                );
+            }
+        }
 
         Ok(())
     }
@@ -324,6 +340,53 @@ impl Database {
         )?;
         Ok(count as usize)
     }
+}
+
+fn apply_migration_1(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS tracks (
+            id TEXT PRIMARY KEY,
+            url TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            alias TEXT,
+            duration INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            available INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS playlists (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+            playlist_id TEXT NOT NULL,
+            track_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY (playlist_id, track_id),
+            FOREIGN KEY (playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
+            FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title);
+        CREATE INDEX IF NOT EXISTS idx_tracks_alias ON tracks(alias);
+        CREATE INDEX IF NOT EXISTS idx_playlist_tracks_position ON playlist_tracks(playlist_id, position);
+        "#,
+    )
+    .with_context(|| "Failed to apply schema migration v1")?;
+    Ok(())
+}
+
+fn record_migration(tx: &Transaction<'_>, version: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        params![version, Utc::now().to_rfc3339()],
+    )
+    .with_context(|| format!("Failed to record schema migration version {}", version))?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -334,6 +334,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bfbf56724aa9eca8afa4fcfadeb479e722935bb2a0900c2d37e0cc477af0688"
 
 [[package]]
+name = "clistream"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "fuzzy-matcher",
+ "interprocess",
+ "predicates",
+ "ratatui",
+ "rodio",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "souvlaki",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "cocoa"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1056,34 +1084,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mixyt"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "fuzzy-matcher",
- "interprocess",
- "predicates",
- "ratatui",
- "rodio",
- "rusqlite",
- "serde",
- "serde_json",
- "souvlaki",
- "tempfile",
- "thiserror 2.0.17",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

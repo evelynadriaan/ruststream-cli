@@ -37,7 +37,7 @@ impl App {
                 println!("Starting daemon...");
                 Daemon::start_detached(&self.config)?;
             } else {
-                bail!("Daemon is not running. Start it with: mixyt daemon start");
+                bail!("Daemon is not running. Start it with: clistream daemon start");
             }
         }
         Ok(client)
@@ -47,7 +47,7 @@ impl App {
         let tracks = self.db.get_all_tracks()?;
 
         if tracks.is_empty() {
-            bail!("Library is empty. Add tracks with: mixyt add <url>");
+            bail!("Library is empty. Add tracks with: clistream add <url>");
         }
 
         // Try exact match first
@@ -79,7 +79,7 @@ impl App {
             })
             .collect();
 
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         if let Some((track, _)) = matches.first() {
             Ok((*track).clone())
@@ -104,7 +104,7 @@ impl App {
         if let Some(existing) = self.db.get_track_by_url(&canonical_url)? {
             println!("Track already in library: {}", existing.display_name());
             println!(
-                "Use 'mixyt remove \"{}\"' first if you want to re-add it.",
+                "Use 'clistream remove \"{}\"' first if you want to re-add it.",
                 title
             );
             return Ok(());
@@ -112,7 +112,11 @@ impl App {
 
         eprintln!("Downloading audio...");
         let mut track = downloader.download(url, |phase| match phase {
-            DownloadPhase::Downloading { percent, speed, eta } => {
+            DownloadPhase::Downloading {
+                percent,
+                speed,
+                eta,
+            } => {
                 eprint!("\r  [{:5.1}%] {} ETA {}    ", percent, speed, eta);
             }
             DownloadPhase::Converting => {
@@ -156,7 +160,7 @@ impl App {
 
         if !track.available {
             bail!(
-                "Track '{}' is marked as unavailable. Run 'mixyt check' to verify.",
+                "Track '{}' is marked as unavailable. Run 'clistream check' to verify.",
                 track.display_name()
             );
         }
@@ -170,7 +174,7 @@ impl App {
                     track.format_duration()
                 );
             }
-            DaemonResponse::Error(e) => bail!("{e}"),
+            DaemonResponse::Error { message, .. } => bail!("{message}"),
             _ => {}
         }
 
@@ -276,7 +280,7 @@ impl App {
             })
             .collect();
 
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         if matches.is_empty() {
             println!("No matches found for '{query}'");

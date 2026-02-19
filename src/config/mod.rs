@@ -6,6 +6,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub app: AppConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub audio: AudioConfig,
@@ -16,15 +18,29 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub config_version: u32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self { config_version: 1 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     pub path: PathBuf,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let path = dirs::data_dir().unwrap_or_else(|| {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            home.join(".local").join("share")
+        });
         Self {
-            path: home.join(".mixyt"),
+            path: path.join("clistream"),
         }
     }
 }
@@ -70,7 +86,7 @@ impl Config {
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("mixyt")
+            .join("clistream")
     }
 
     pub fn config_path() -> PathBuf {
@@ -119,15 +135,18 @@ impl Config {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.storage.path.join("mixyt.db")
+        self.storage.path.join("clistream.db")
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.storage.path.join("mixyt.sock")
+        let runtime_socket = dirs::runtime_dir()
+            .map(|p| p.join("clistream"))
+            .unwrap_or_else(|| self.storage.path.clone());
+        runtime_socket.join("clistream.sock")
     }
 
     pub fn pid_path(&self) -> PathBuf {
-        self.storage.path.join("mixyt.pid")
+        self.storage.path.join("clistream.pid")
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
@@ -143,6 +162,14 @@ impl Config {
                 self.audio_dir().display()
             )
         })?;
+        if let Some(parent) = self.socket_path().parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create runtime socket directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
         Ok(())
     }
 }

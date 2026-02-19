@@ -4,7 +4,7 @@ mod commands;
 pub use commands::*;
 
 #[derive(Parser)]
-#[command(name = "mixyt")]
+#[command(name = "clistream")]
 #[command(about = "A CLI tool for saving, managing, and playing YouTube audio")]
 #[command(version)]
 pub struct Cli {

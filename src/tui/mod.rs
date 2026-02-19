@@ -116,9 +116,15 @@ impl Tui {
                         self.status_message = Some(msg);
                     }
                     Ok(DownloadUpdate::Progress(phase)) => match phase {
-                        DownloadPhase::Downloading { percent, speed, eta } => {
-                            self.status_message =
-                                Some(format!("Downloading: {:.1}% ({}, ETA {})", percent, speed, eta));
+                        DownloadPhase::Downloading {
+                            percent,
+                            speed,
+                            eta,
+                        } => {
+                            self.status_message = Some(format!(
+                                "Downloading: {:.1}% ({}, ETA {})",
+                                percent, speed, eta
+                            ));
                         }
                         DownloadPhase::Converting => {
                             self.status_message = Some("Converting audio...".to_string());
@@ -135,8 +141,7 @@ impl Tui {
                                         self.library_state.select(Some(0));
                                     }
                                 } else {
-                                    self.status_message =
-                                        Some("Failed to save track".to_string());
+                                    self.status_message = Some("Failed to save track".to_string());
                                 }
                             }
                             Err(e) => {
@@ -147,7 +152,8 @@ impl Tui {
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        self.status_message = Some("Download thread terminated unexpectedly".to_string());
+                        self.status_message =
+                            Some("Download thread terminated unexpectedly".to_string());
                         self.download_rx = None;
                     }
                 }
@@ -641,7 +647,7 @@ impl Tui {
             })
             .collect();
 
-        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         if let Some((index, _)) = matches.first() {
             self.library_state.select(Some(*index));

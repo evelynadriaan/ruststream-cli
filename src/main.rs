@@ -10,6 +10,7 @@ mod tui;
 
 use anyhow::Result;
 use clap::Parser;
+use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 
 use cli::{App, Cli, Commands, DaemonCommands};
@@ -24,8 +25,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let app = App::new()?;
 
-    // Default to TUI if no command given
-    let command = cli.command.unwrap_or(Commands::Tui);
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                Commands::Tui
+            } else {
+                anyhow::bail!(
+                    "No subcommand provided in non-interactive mode. Use: clistream help"
+                );
+            }
+        }
+    };
 
     match command {
         Commands::Add { url, alias } => {

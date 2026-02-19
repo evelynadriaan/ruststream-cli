@@ -9,7 +9,10 @@ use tracing::{error, info, warn};
 
 use crate::audio::AudioPlayer;
 use crate::config::Config;
-use crate::ipc::{DaemonCommand, DaemonResponse};
+use crate::ipc::{
+    DaemonCommand, DaemonErrorCode, DaemonRequestEnvelope, DaemonResponse, DaemonResponseEnvelope,
+    PROTOCOL_VERSION,
+};
 use crate::models::{PlaybackState, RepeatMode, Track};
 
 // Internal commands for the audio thread
@@ -153,11 +156,9 @@ impl Daemon {
                 .with_context(|| "Failed to start daemon")?;
         }
 
-        for _ in 0..50 {
-            if socket_path.exists() {
-                return Ok(());
-            }
-            thread::sleep(std::time::Duration::from_millis(100));
+        let client = crate::ipc::DaemonClient::new(&socket_path);
+        if client.wait_until_ready(std::time::Duration::from_secs(5)) {
+            return Ok(());
         }
 
         anyhow::bail!("Daemon failed to start")
@@ -196,8 +197,8 @@ fn init_media_controls(
     let hwnd = None;
 
     let config = PlatformConfig {
-        dbus_name: "mixyt",
-        display_name: "mixyt",
+        dbus_name: "clistream",
+        display_name: "clistream",
         hwnd,
     };
 
@@ -268,7 +269,7 @@ fn update_media_controls_loop(
             if last_track_id != Some(track.id) {
                 let _ = controls.set_metadata(MediaMetadata {
                     title: Some(&track.title),
-                    artist: Some("mixyt"),
+                    artist: Some("clistream"),
                     album: None,
                     cover_url: None,
                     duration: Some(std::time::Duration::from_secs(track.duration)),
@@ -418,8 +419,25 @@ fn handle_connection(
     let mut line = String::new();
     reader.read_line(&mut line)?;
 
-    let command: DaemonCommand = serde_json::from_str(&line)?;
-    let response = handle_command(command, state, running, audio_tx);
+    let response = match serde_json::from_str::<DaemonRequestEnvelope>(&line) {
+        Ok(request) => {
+            if request.protocol_version != PROTOCOL_VERSION {
+                error_response(
+                    DaemonErrorCode::IpcProtocolMismatch,
+                    format!(
+                        "Protocol mismatch (client={}, daemon={})",
+                        request.protocol_version, PROTOCOL_VERSION
+                    ),
+                )
+            } else {
+                handle_command(request.command, state, running, audio_tx)
+            }
+        }
+        Err(e) => error_response(
+            DaemonErrorCode::IpcProtocolMismatch,
+            format!("Invalid daemon request payload: {e}"),
+        ),
+    };
 
     let response_json = serde_json::to_string(&response)?;
     writeln!(writer, "{response_json}")?;
@@ -433,13 +451,16 @@ fn handle_command(
     state: &Arc<Mutex<PlaybackState>>,
     running: &Arc<AtomicBool>,
     audio_tx: &Sender<AudioCommand>,
-) -> DaemonResponse {
+) -> DaemonResponseEnvelope {
     match command {
         DaemonCommand::Play { track } => {
             if audio_tx.send(AudioCommand::Play(track)).is_ok() {
-                DaemonResponse::Ok
+                ok_response(DaemonResponse::Ok)
             } else {
-                DaemonResponse::Error("Audio thread not running".to_string())
+                error_response(
+                    DaemonErrorCode::InternalError,
+                    "Audio thread not running".to_string(),
+                )
             }
         }
         DaemonCommand::PlayQueue {
@@ -447,7 +468,10 @@ fn handle_command(
             start_index,
         } => {
             if tracks.is_empty() {
-                return DaemonResponse::Error("Queue is empty".to_string());
+                return error_response(
+                    DaemonErrorCode::TrackNotFound,
+                    "Queue is empty".to_string(),
+                );
             }
 
             let idx = start_index.min(tracks.len() - 1);
@@ -460,28 +484,34 @@ fn handle_command(
             }
 
             if audio_tx.send(AudioCommand::Play(track)).is_ok() {
-                DaemonResponse::Ok
+                ok_response(DaemonResponse::Ok)
             } else {
-                DaemonResponse::Error("Audio thread not running".to_string())
+                error_response(
+                    DaemonErrorCode::InternalError,
+                    "Audio thread not running".to_string(),
+                )
             }
         }
         DaemonCommand::Pause => {
             let _ = audio_tx.send(AudioCommand::Pause);
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::Resume => {
             let _ = audio_tx.send(AudioCommand::Resume);
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::Stop => {
             let _ = audio_tx.send(AudioCommand::Stop);
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::Next => {
             let next_track = {
                 let mut s = state.lock().unwrap();
                 if s.queue.is_empty() {
-                    return DaemonResponse::Error("Queue is empty".to_string());
+                    return error_response(
+                        DaemonErrorCode::TrackNotFound,
+                        "Queue is empty".to_string(),
+                    );
                 }
 
                 let next_idx = if s.shuffle {
@@ -496,7 +526,7 @@ fn handle_command(
                 if !s.shuffle && next_idx == 0 && s.repeat == RepeatMode::Off {
                     s.is_playing = false;
                     s.current_track = None;
-                    return DaemonResponse::Ok;
+                    return ok_response(DaemonResponse::Ok);
                 }
 
                 s.queue_index = next_idx;
@@ -504,16 +534,22 @@ fn handle_command(
             };
 
             if audio_tx.send(AudioCommand::Play(next_track)).is_ok() {
-                DaemonResponse::Ok
+                ok_response(DaemonResponse::Ok)
             } else {
-                DaemonResponse::Error("Audio thread not running".to_string())
+                error_response(
+                    DaemonErrorCode::InternalError,
+                    "Audio thread not running".to_string(),
+                )
             }
         }
         DaemonCommand::Previous => {
             let prev_track = {
                 let mut s = state.lock().unwrap();
                 if s.queue.is_empty() {
-                    return DaemonResponse::Error("Queue is empty".to_string());
+                    return error_response(
+                        DaemonErrorCode::TrackNotFound,
+                        "Queue is empty".to_string(),
+                    );
                 }
 
                 let prev_idx = if s.queue_index == 0 {
@@ -527,45 +563,67 @@ fn handle_command(
             };
 
             if audio_tx.send(AudioCommand::Play(prev_track)).is_ok() {
-                DaemonResponse::Ok
+                ok_response(DaemonResponse::Ok)
             } else {
-                DaemonResponse::Error("Audio thread not running".to_string())
+                error_response(
+                    DaemonErrorCode::InternalError,
+                    "Audio thread not running".to_string(),
+                )
             }
         }
         DaemonCommand::Seek { position } => {
             let _ = audio_tx.send(AudioCommand::Seek(position));
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::SetVolume { volume } => {
             let _ = audio_tx.send(AudioCommand::SetVolume(volume));
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::SetShuffle { enabled } => {
             state.lock().unwrap().shuffle = enabled;
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::SetRepeat { mode } => {
             state.lock().unwrap().repeat = mode;
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::QueueAdd { track } => {
             state.lock().unwrap().queue.push(track);
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::QueueClear => {
             let mut s = state.lock().unwrap();
             s.queue.clear();
             s.queue_index = 0;
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::GetStatus => {
             let s = state.lock().unwrap().clone();
-            DaemonResponse::Status(s)
+            ok_response(DaemonResponse::Status(s))
         }
         DaemonCommand::Shutdown => {
             running.store(false, Ordering::SeqCst);
             let _ = audio_tx.send(AudioCommand::Stop);
-            DaemonResponse::Ok
+            ok_response(DaemonResponse::Ok)
         }
+    }
+}
+
+fn ok_response(response: DaemonResponse) -> DaemonResponseEnvelope {
+    DaemonResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        response,
+        error_code: None,
+    }
+}
+
+fn error_response(code: DaemonErrorCode, message: String) -> DaemonResponseEnvelope {
+    DaemonResponseEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        response: DaemonResponse::Error {
+            code: Some(code),
+            message,
+        },
+        error_code: Some(code),
     }
 }
