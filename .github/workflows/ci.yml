@@ -10,13 +10,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    runs-on: macos-latest
+  linux-test:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev ffmpeg yt-dlp
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Build
         run: cargo build --verbose
@@ -24,28 +29,51 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-  clippy:
-    runs-on: macos-latest
+  linux-clippy:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
 
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-  format:
-    runs-on: macos-latest
+  linux-format:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
 
       - name: Check formatting
         run: cargo fmt -- --check
+
+  linux-release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build release artifact
+        run: cargo build --release --target x86_64-unknown-linux-gnu
