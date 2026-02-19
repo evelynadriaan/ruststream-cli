@@ -2,7 +2,18 @@
 
 **Offline-first terminal audio library for YouTube — Rust + daemon + TUI.**
 
-Save YouTube audio to a local library, manage playlists, and play everything from the terminal. No browser tabs. No Electron. No accounts.
+[![CI](https://github.com/evelynadriaan/ruststream-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/evelynadriaan/ruststream-cli/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/evelynadriaan/ruststream-cli)](https://github.com/evelynadriaan/ruststream-cli/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey)](https://github.com/evelynadriaan/ruststream-cli/releases)
+
+---
+
+**Problem:** YouTube is the world's largest music library but accessing it requires a browser, ads, and an active connection.
+**For:** Developers and power users who live in the terminal.
+**Does:** Downloads YouTube audio to a local library and plays it from a keyboard-driven TUI with a background daemon.
+**Why better:** Offline after download. No account. No Electron. Everything in one terminal window.
+**Status:** v1.1.0 — stable. CI-tested on Linux x86_64. Prebuilt binary available.
 
 ---
 
