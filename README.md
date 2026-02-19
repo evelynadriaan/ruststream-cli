@@ -1,8 +1,6 @@
- # clistream
+ # rustream-cli
 
 A CLI tool for saving and playing YouTube audio from the terminal on Linux.
-
-![clistream TUI](screenshot.png)
 
 ## Install
 
