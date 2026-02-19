@@ -29,6 +29,7 @@ enum AppMode {
     #[default]
     Normal,
     Search,
+    YtSearch,
     Edit,
     AddUrl,
     StreamUrl,
@@ -39,6 +40,7 @@ enum LibraryView {
     #[default]
     Local,
     StreamQueue,
+    YtResults,
 }
 
 enum DownloadUpdate {
@@ -54,6 +56,8 @@ pub struct Tui {
     tracks: Vec<Track>,
     library_state: ListState,
     stream_queue_state: ListState,
+    yt_results: Vec<StreamEntry>,
+    yt_results_state: ListState,
     playback_state: PlaybackState,
     mode: AppMode,
     input_buf: String,
@@ -99,6 +103,8 @@ impl Tui {
             tracks,
             library_state,
             stream_queue_state,
+            yt_results: Vec::new(),
+            yt_results_state: ListState::default(),
             playback_state,
             mode: AppMode::Normal,
             input_buf: String::new(),
@@ -218,6 +224,25 @@ impl Tui {
                             }
                             _ => {}
                         },
+                        AppMode::YtSearch => match key.code {
+                            KeyCode::Esc => {
+                                self.mode = AppMode::Normal;
+                                self.input_buf.clear();
+                                self.yt_results.clear();
+                                self.yt_results_state.select(None);
+                            }
+                            KeyCode::Enter => {
+                                self.mode = AppMode::Normal;
+                                self.search_youtube();
+                            }
+                            KeyCode::Backspace => {
+                                self.input_buf.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                self.input_buf.push(c);
+                            }
+                            _ => {}
+                        },
                         AppMode::Edit => match key.code {
                             KeyCode::Esc => {
                                 self.mode = AppMode::Normal;
@@ -279,7 +304,20 @@ impl Tui {
                                     self.mode = AppMode::Search;
                                     self.input_buf.clear();
                                 }
+                                KeyCode::Char('?') => {
+                                    self.mode = AppMode::YtSearch;
+                                    self.input_buf.clear();
+                                }
+                                KeyCode::Esc if self.library_view == LibraryView::YtResults => {
+                                    self.library_view = LibraryView::Local;
+                                }
                                 KeyCode::Char('e') => self.start_edit(),
+                                KeyCode::Char('a')
+                                    if self.library_view == LibraryView::YtResults
+                                        && self.download_rx.is_none() =>
+                                {
+                                    self.add_selected_yt_result_to_library();
+                                }
                                 KeyCode::Char('a') if self.download_rx.is_none() => {
                                     self.library_view = LibraryView::Local;
                                     self.mode = AppMode::AddUrl;
@@ -302,6 +340,9 @@ impl Tui {
                                 KeyCode::Down | KeyCode::Char('j') => self.select_next(),
                                 KeyCode::Left | KeyCode::Char('h') => self.prev_or_seek_backward(),
                                 KeyCode::Right => self.next_or_seek_forward(),
+                                KeyCode::Enter if self.library_view == LibraryView::YtResults => {
+                                    self.stream_selected_yt_result();
+                                }
                                 KeyCode::Enter => self.play_selected(),
                                 KeyCode::Char(' ') => self.toggle_or_play(),
                                 KeyCode::Char('+') | KeyCode::Char('=') => self.volume_up(),
@@ -483,6 +524,7 @@ impl Tui {
         match self.library_view {
             LibraryView::Local => self.render_local_library(f, area),
             LibraryView::StreamQueue => self.render_stream_queue(f, area),
+            LibraryView::YtResults => self.render_yt_results(f, area),
         }
     }
 
@@ -570,11 +612,39 @@ impl Tui {
         f.render_stateful_widget(list, area, &mut self.stream_queue_state.clone());
     }
 
+    fn render_yt_results(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(" YouTube Results — Enter:Stream  a:Add to library  Esc:Back ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+
+        let items: Vec<ListItem> = self
+            .yt_results
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| ListItem::new(format!("{:>2}. {}", i + 1, entry.title)))
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▸ ");
+
+        f.render_stateful_widget(list, area, &mut self.yt_results_state.clone());
+    }
+
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let (help_text, style) = match self.mode {
             AppMode::Search => (
                 format!(
                     " Search: {}▌  (Enter to search, Esc to cancel)",
+                    self.input_buf
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+            AppMode::YtSearch => (
+                format!(
+                    " Search YouTube: {}▌  Enter to search  Esc to cancel ",
                     self.input_buf
                 ),
                 Style::default().fg(Color::DarkGray),
@@ -650,6 +720,18 @@ impl Tui {
                 };
                 self.stream_queue_state.select(Some(i));
             }
+            LibraryView::YtResults => {
+                let len = self.yt_results.len();
+                if len == 0 {
+                    return;
+                }
+
+                let i = match self.yt_results_state.selected() {
+                    Some(i) => (i + 1) % len,
+                    None => 0,
+                };
+                self.yt_results_state.select(Some(i));
+            }
         }
     }
 
@@ -690,6 +772,24 @@ impl Tui {
                     None => 0,
                 };
                 self.stream_queue_state.select(Some(i));
+            }
+            LibraryView::YtResults => {
+                let len = self.yt_results.len();
+                if len == 0 {
+                    return;
+                }
+
+                let i = match self.yt_results_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            len - 1
+                        } else {
+                            i - 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.yt_results_state.select(Some(i));
             }
         }
     }
@@ -978,6 +1078,82 @@ impl Tui {
         }
     }
 
+    fn search_youtube(&mut self) {
+        let query = self.input_buf.trim().to_string();
+        self.input_buf.clear();
+
+        if query.is_empty() {
+            self.status_message = Some("Enter a search query".to_string());
+            return;
+        }
+
+        self.status_message = Some(format!("Searching YouTube: {}", query));
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_yt_search_results(&query));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(results)) => {
+                self.yt_results = results;
+                if self.yt_results.is_empty() {
+                    self.yt_results_state.select(None);
+                    self.status_message = Some("No YouTube results found".to_string());
+                    return;
+                }
+                self.yt_results_state.select(Some(0));
+                self.library_view = LibraryView::YtResults;
+                self.status_message =
+                    Some(format!("Found {} YouTube results", self.yt_results.len()));
+            }
+            Ok(Err(e)) => {
+                self.status_message = Some(format!("YouTube search failed: {}", e));
+            }
+            Err(_) => {
+                self.status_message = Some("YouTube search timed out".to_string());
+            }
+        }
+    }
+
+    fn stream_selected_yt_result(&mut self) {
+        if self.library_view != LibraryView::YtResults {
+            return;
+        }
+
+        let Some(i) = self.yt_results_state.selected() else {
+            return;
+        };
+        let Some(entry) = self.yt_results.get(i) else {
+            return;
+        };
+
+        self.status_message = match self.client.stream(entry.url.clone()) {
+            Ok(DaemonResponse::Ok) => Some(format!("Streaming: {}", entry.title)),
+            Ok(DaemonResponse::Error { message, .. }) => {
+                Some(format!("Stream failed: {}", message))
+            }
+            Ok(_) => Some("Unexpected daemon response".to_string()),
+            Err(e) => Some(format!("Stream failed: {}", e)),
+        };
+    }
+
+    fn add_selected_yt_result_to_library(&mut self) {
+        if self.library_view != LibraryView::YtResults {
+            return;
+        }
+
+        let Some(i) = self.yt_results_state.selected() else {
+            return;
+        };
+        let Some(entry) = self.yt_results.get(i) else {
+            return;
+        };
+
+        self.input_buf = entry.url.clone();
+        self.add_track();
+    }
+
     fn apply_search(&mut self) {
         if self.input_buf.is_empty() {
             return;
@@ -1017,6 +1193,69 @@ impl Tui {
 
 pub fn fetch_playlist_entries(url: &str) -> std::result::Result<Vec<StreamEntry>, String> {
     fetch_playlist_entries_with_command("yt-dlp", url)
+}
+
+pub fn fetch_yt_search_results(query: &str) -> std::result::Result<Vec<StreamEntry>, String> {
+    fetch_yt_search_results_with_command("yt-dlp", query)
+}
+
+fn fetch_yt_search_results_with_command(
+    command: &str,
+    query: &str,
+) -> std::result::Result<Vec<StreamEntry>, String> {
+    let yt_query = format!("ytsearch10:{}", query);
+    let mut child = Command::new(command)
+        .args([yt_query.as_str(), "--flat-playlist", "--dump-json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    out.read_to_string(&mut stdout)
+                        .map_err(|e| format!("Failed to read yt-dlp output: {}", e))?;
+                }
+
+                let mut stderr = String::new();
+                if let Some(mut err) = child.stderr.take() {
+                    err.read_to_string(&mut stderr)
+                        .map_err(|e| format!("Failed to read yt-dlp stderr: {}", e))?;
+                }
+
+                if !status.success() {
+                    let err = stderr.trim();
+                    return Err(if err.is_empty() {
+                        "yt-dlp search failed".to_string()
+                    } else {
+                        format!("yt-dlp failed: {}", err)
+                    });
+                }
+
+                let mut entries = parse_playlist_entries_lines(&stdout)?;
+                if entries.len() > 10 {
+                    entries.truncate(10);
+                }
+                return Ok(entries);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Timed out fetching YouTube search results".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("Failed while waiting for yt-dlp: {}", e));
+            }
+        }
+    }
 }
 
 pub fn fetch_playlist_entries_with_command(
