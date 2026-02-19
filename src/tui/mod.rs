@@ -292,6 +292,12 @@ impl Tui {
                                 KeyCode::Char('l') => {
                                     self.library_view = LibraryView::Local;
                                 }
+                                KeyCode::Char('d') | KeyCode::Delete => {
+                                    self.remove_selected_track();
+                                }
+                                KeyCode::Char('S') if self.playback_state.is_streaming => {
+                                    self.save_current_stream_shortcut();
+                                }
                                 KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
                                 KeyCode::Down | KeyCode::Char('j') => self.select_next(),
                                 KeyCode::Left | KeyCode::Char('h') => self.prev_or_seek_backward(),
@@ -598,9 +604,16 @@ impl Tui {
                 if let Some(ref msg) = self.status_message {
                     (format!(" {}", msg), Style::default().fg(Color::Yellow))
                 } else {
+                    let save_stream_hint = if self.playback_state.is_streaming {
+                        "  S:Save stream"
+                    } else {
+                        ""
+                    };
                     (
-                        " q:Quit  /:Search  a:Add  s:Stream  e:Edit  l:Library  ↑↓:Nav  ←/h:Prev  →:Next/Seek  Space:Play  +/-:Vol"
-                            .to_string(),
+                        format!(
+                            " q:Quit  /:Search  a:Add  s:Stream  e:Edit  d:Remove  l:Library{}  ↑↓:Nav  ←/h:Prev  →:Next/Seek  Space:Play  +/-:Vol",
+                            save_stream_hint
+                        ),
                         Style::default().fg(Color::DarkGray),
                     )
                 }
@@ -802,6 +815,57 @@ impl Tui {
         }
 
         self.input_buf.clear();
+    }
+
+    fn remove_selected_track(&mut self) {
+        if self.library_view != LibraryView::Local {
+            return;
+        }
+
+        let Some(i) = self.library_state.selected() else {
+            return;
+        };
+        let Some(track) = self.tracks.get(i).cloned() else {
+            return;
+        };
+
+        if let Err(e) = self.db.delete_track(&track.id) {
+            self.status_message = Some(format!("Failed to remove: {}", e));
+            return;
+        }
+
+        let deleted_was_playing = self
+            .playback_state
+            .current_track
+            .as_ref()
+            .map(|current| current.id == track.id)
+            .unwrap_or(false);
+        if deleted_was_playing {
+            let _ = self.client.stop();
+        }
+
+        let removed_track = self.tracks.remove(i);
+        if self.tracks.is_empty() {
+            self.library_state.select(None);
+        } else {
+            let next_index = i.min(self.tracks.len() - 1);
+            self.library_state.select(Some(next_index));
+        }
+
+        self.status_message = Some(format!("Removed: {}", removed_track.display_name()));
+    }
+
+    fn save_current_stream_shortcut(&mut self) {
+        if !self.playback_state.is_streaming {
+            return;
+        }
+
+        self.status_message = match self.client.save_current_stream() {
+            Ok(DaemonResponse::Ok) => Some("Saving stream to library…".to_string()),
+            Ok(DaemonResponse::Error { message, .. }) => Some(format!("Save failed: {}", message)),
+            Ok(_) => Some("Unexpected daemon response".to_string()),
+            Err(e) => Some(format!("Save failed: {}", e)),
+        };
     }
 
     fn add_track(&mut self) {
