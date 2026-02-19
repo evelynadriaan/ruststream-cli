@@ -169,8 +169,14 @@ impl Daemon {
         let monitor_state = Arc::clone(&state);
         let monitor_running = Arc::clone(&running);
         let monitor_audio_tx = audio_tx.clone();
+        let monitor_stream_context = Arc::clone(&stream_context);
         thread::spawn(move || {
-            playback_monitor(monitor_state, monitor_running, monitor_audio_tx);
+            playback_monitor(
+                monitor_state,
+                monitor_stream_context,
+                monitor_running,
+                monitor_audio_tx,
+            );
         });
 
         // Initialize media controls (for system media keys)
@@ -536,6 +542,7 @@ fn stream_track(url: &str) -> Track {
 
 fn playback_monitor(
     state: Arc<Mutex<PlaybackState>>,
+    stream_context: Arc<Mutex<StreamContext>>,
     running: Arc<AtomicBool>,
     audio_tx: Sender<AudioCommand>,
 ) {
@@ -568,7 +575,88 @@ fn playback_monitor(
                 .unwrap_or(false);
 
         if finished {
-            apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Finished);
+            enum FinishAction {
+                PlayTrack(Track),
+                StreamUrl(String),
+                Stop,
+            }
+
+            let action = {
+                let mut s = state.lock().unwrap();
+
+                if s.is_streaming && !s.stream_queue.is_empty() {
+                    let next_idx = (s.stream_queue_index + 1) % s.stream_queue.len();
+                    s.stream_queue_index = next_idx;
+                    FinishAction::StreamUrl(s.stream_queue[next_idx].url.clone())
+                } else if s.queue.is_empty() {
+                    FinishAction::Stop
+                } else if s.repeat == RepeatMode::One {
+                    let idx = s.queue_index.min(s.queue.len() - 1);
+                    s.queue_index = idx;
+                    FinishAction::PlayTrack(s.queue[idx].clone())
+                } else if s.shuffle {
+                    use std::collections::hash_map::RandomState;
+                    use std::hash::{BuildHasher, Hasher};
+                    let random = RandomState::new().build_hasher().finish() as usize;
+                    let next_idx = random % s.queue.len();
+                    s.queue_index = next_idx;
+                    FinishAction::PlayTrack(s.queue[next_idx].clone())
+                } else if s.queue_index + 1 >= s.queue.len() {
+                    if s.repeat == RepeatMode::All {
+                        s.queue_index = 0;
+                        FinishAction::PlayTrack(s.queue[0].clone())
+                    } else {
+                        FinishAction::Stop
+                    }
+                } else {
+                    s.queue_index += 1;
+                    FinishAction::PlayTrack(s.queue[s.queue_index].clone())
+                }
+            };
+
+            match action {
+                FinishAction::PlayTrack(track) => {
+                    if audio_tx.send(AudioCommand::Play(track)).is_err() {
+                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Error);
+                    }
+                }
+                FinishAction::StreamUrl(url) => {
+                    let (response_tx, response_rx) = mpsc::channel();
+                    if audio_tx
+                        .send(AudioCommand::Stream {
+                            url: url.clone(),
+                            response_tx,
+                        })
+                        .is_err()
+                    {
+                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Error);
+                        continue;
+                    }
+
+                    match response_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(Ok(())) => {
+                            stream_context.lock().unwrap().current_stream_url = Some(url);
+                        }
+                        Ok(Err(e)) => {
+                            error!(error = %e, "Failed to auto-advance streaming queue");
+                            apply_playback_transition(
+                                &mut state.lock().unwrap(),
+                                PlaybackEvent::Error,
+                            );
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Timed out auto-advancing streaming queue");
+                            apply_playback_transition(
+                                &mut state.lock().unwrap(),
+                                PlaybackEvent::Error,
+                            );
+                        }
+                    }
+                }
+                FinishAction::Stop => {
+                    apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Finished);
+                }
+            }
         }
     }
 }
@@ -727,23 +815,29 @@ fn handle_command(
                     );
                 }
 
-                let next_idx = if s.shuffle {
-                    use std::collections::hash_map::RandomState;
-                    use std::hash::{BuildHasher, Hasher};
-                    let random = RandomState::new().build_hasher().finish() as usize;
-                    random % s.queue.len()
+                if s.repeat == RepeatMode::One {
+                    let idx = s.queue_index.min(s.queue.len() - 1);
+                    s.queue_index = idx;
+                    s.queue[idx].clone()
                 } else {
-                    (s.queue_index + 1) % s.queue.len()
-                };
+                    let next_idx = if s.shuffle {
+                        use std::collections::hash_map::RandomState;
+                        use std::hash::{BuildHasher, Hasher};
+                        let random = RandomState::new().build_hasher().finish() as usize;
+                        random % s.queue.len()
+                    } else {
+                        (s.queue_index + 1) % s.queue.len()
+                    };
 
-                if !s.shuffle && next_idx == 0 && s.repeat == RepeatMode::Off {
-                    s.is_playing = false;
-                    s.current_track = None;
-                    return ok_response(DaemonResponse::Ok);
+                    if !s.shuffle && next_idx == 0 && s.repeat == RepeatMode::Off {
+                        s.is_playing = false;
+                        s.current_track = None;
+                        return ok_response(DaemonResponse::Ok);
+                    }
+
+                    s.queue_index = next_idx;
+                    s.queue[next_idx].clone()
                 }
-
-                s.queue_index = next_idx;
-                s.queue[next_idx].clone()
             };
 
             if audio_tx.send(AudioCommand::Play(next_track)).is_ok() {
