@@ -1,6 +1,6 @@
- # ruststream-cli
+# RustStream CLI
 
-A CLI tool for saving and playing YouTube audio from the terminal on Linux.
+Offline-first terminal audio library for YouTube (Rust + daemon + TUI).
 
 ## Install
 

@@ -1,10 +1,11 @@
 [package]
 name = "clistream"
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
-description = "A CLI tool for saving, managing, and playing YouTube audio streams"
+description = "Offline-first terminal audio library for YouTube (Rust + daemon + TUI)"
 license = "MIT"
 authors = ["Nicolai"]
+repository = "https://github.com/evelynadriaan/ruststream-cli"
 
 [dependencies]
 # CLI
