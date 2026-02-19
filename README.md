@@ -6,12 +6,6 @@ Save YouTube audio to a local library, manage playlists, and play everything fro
 
 ---
 
-## Demo
-
-![RustStream CLI TUI](screenshot.png)
-
----
-
 ## Why this exists
 
 Browser tabs accumulate. Streaming services shuffle catalogues. This tool solves a specific problem: build a personal audio library from YouTube, own it locally, and control it entirely from the terminal. It is built for people who live in the terminal and want their music workflow to match.
