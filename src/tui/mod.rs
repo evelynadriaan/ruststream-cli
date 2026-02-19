@@ -951,8 +951,15 @@ impl Tui {
     }
 }
 
-fn fetch_playlist_entries(url: &str) -> std::result::Result<Vec<StreamEntry>, String> {
-    let mut child = Command::new("yt-dlp")
+pub fn fetch_playlist_entries(url: &str) -> std::result::Result<Vec<StreamEntry>, String> {
+    fetch_playlist_entries_with_command("yt-dlp", url)
+}
+
+pub fn fetch_playlist_entries_with_command(
+    command: &str,
+    url: &str,
+) -> std::result::Result<Vec<StreamEntry>, String> {
+    let mut child = Command::new(command)
         .args(["--flat-playlist", "--dump-json", url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -985,55 +992,7 @@ fn fetch_playlist_entries(url: &str) -> std::result::Result<Vec<StreamEntry>, St
                     });
                 }
 
-                let mut entries = Vec::new();
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let json: Value = serde_json::from_str(line)
-                        .map_err(|e| format!("Failed to parse yt-dlp JSON line: {}", e))?;
-
-                    let title = json
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Untitled")
-                        .trim();
-
-                    let raw_url = json
-                        .get("webpage_url")
-                        .and_then(Value::as_str)
-                        .or_else(|| json.get("url").and_then(Value::as_str))
-                        .unwrap_or("")
-                        .trim();
-
-                    if raw_url.is_empty() {
-                        continue;
-                    }
-
-                    let resolved_url =
-                        if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
-                            raw_url.to_string()
-                        } else {
-                            format!("https://www.youtube.com/watch?v={}", raw_url)
-                        };
-
-                    entries.push(StreamEntry {
-                        title: if title.is_empty() {
-                            "Untitled".to_string()
-                        } else {
-                            title.to_string()
-                        },
-                        url: resolved_url,
-                    });
-                }
-
-                if entries.is_empty() {
-                    return Err("Playlist contains no playable entries".to_string());
-                }
-
-                return Ok(entries);
+                return parse_playlist_entries_lines(&stdout);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -1048,6 +1007,57 @@ fn fetch_playlist_entries(url: &str) -> std::result::Result<Vec<StreamEntry>, St
             }
         }
     }
+}
+
+fn parse_playlist_entries_lines(stdout: &str) -> std::result::Result<Vec<StreamEntry>, String> {
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let json: Value = serde_json::from_str(line)
+            .map_err(|e| format!("Failed to parse yt-dlp JSON line: {}", e))?;
+
+        let title = json
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled")
+            .trim();
+
+        let raw_url = json
+            .get("webpage_url")
+            .and_then(Value::as_str)
+            .or_else(|| json.get("url").and_then(Value::as_str))
+            .unwrap_or("")
+            .trim();
+
+        if raw_url.is_empty() {
+            continue;
+        }
+
+        let resolved_url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+            raw_url.to_string()
+        } else {
+            format!("https://www.youtube.com/watch?v={}", raw_url)
+        };
+
+        entries.push(StreamEntry {
+            title: if title.is_empty() {
+                "Untitled".to_string()
+            } else {
+                title.to_string()
+            },
+            url: resolved_url,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err("Playlist contains no playable entries".to_string());
+    }
+
+    Ok(entries)
 }
 
 pub fn run(config: Config, db: Database) -> Result<()> {
