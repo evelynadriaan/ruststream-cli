@@ -9,7 +9,7 @@ use crate::daemon::Daemon;
 use crate::db::Database;
 use crate::download::{DownloadPhase, Downloader};
 use crate::ipc::{DaemonClient, DaemonResponse};
-use crate::models::{LibraryExport, PlaybackState, Track};
+use crate::models::{LibraryExport, PlaybackState, Playlist, RepeatMode, Track};
 
 pub struct App {
     pub config: Config,
@@ -166,7 +166,10 @@ impl App {
         }
 
         let client = self.ensure_daemon()?;
-        match client.play(track.clone())? {
+        let queue = self.db.get_all_tracks()?;
+        let start_index = queue.iter().position(|t| t.id == track.id).unwrap_or(0);
+
+        match client.play_queue(queue, start_index)? {
             DaemonResponse::Ok => {
                 println!(
                     "Playing: {} ({})",
@@ -317,6 +320,240 @@ impl App {
         let status = client.get_status()?;
         print_status(&status);
 
+        Ok(())
+    }
+
+    pub fn stream(&self, url: &str) -> Result<()> {
+        let client = self.ensure_daemon()?;
+        let response = if is_playlist_url(url) {
+            client.stream_playlist(url.to_string())?
+        } else {
+            client.stream(url.to_string())?
+        };
+
+        match response {
+            DaemonResponse::Ok => {
+                if is_playlist_url(url) {
+                    println!("Streaming playlist: {url}");
+                } else {
+                    println!("Streaming: {url}");
+                }
+            }
+            DaemonResponse::Error { code, message } => {
+                if let Some(code) = code {
+                    let code = serde_json::to_string(&code)
+                        .unwrap_or_else(|_| format!("{:?}", code))
+                        .trim_matches('"')
+                        .to_string();
+                    bail!("{}: {}", code, message);
+                }
+                bail!("{message}");
+            }
+            _ => bail!("Unexpected daemon response"),
+        }
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let client = self.ensure_daemon()?;
+        match client.save_current_stream()? {
+            DaemonResponse::Ok => {
+                println!("Saving current stream in background.");
+            }
+            DaemonResponse::Error { code, message } => {
+                if let Some(code) = code {
+                    let code = serde_json::to_string(&code)
+                        .unwrap_or_else(|_| format!("{:?}", code))
+                        .trim_matches('"')
+                        .to_string();
+                    bail!("{}: {}", code, message);
+                }
+                bail!("{message}");
+            }
+            _ => bail!("Unexpected daemon response"),
+        }
+        Ok(())
+    }
+
+    pub fn next(&self) -> Result<()> {
+        let client = self.ensure_daemon()?;
+        match client.next()? {
+            DaemonResponse::Ok => {
+                println!("Skipped to next track.");
+            }
+            DaemonResponse::Error { message, .. } => bail!("{message}"),
+            _ => bail!("Unexpected daemon response"),
+        }
+        Ok(())
+    }
+
+    pub fn prev(&self) -> Result<()> {
+        let client = self.ensure_daemon()?;
+        match client.previous()? {
+            DaemonResponse::Ok => {
+                println!("Returned to previous track.");
+            }
+            DaemonResponse::Error { message, .. } => bail!("{message}"),
+            _ => bail!("Unexpected daemon response"),
+        }
+        Ok(())
+    }
+
+    pub fn queue_add(&self, query: &str) -> Result<()> {
+        let track = self.find_track(query)?;
+        let client = self.ensure_daemon()?;
+        match client.queue_add(track.clone())? {
+            DaemonResponse::Ok => {
+                println!("Added to queue: {}", track.display_name());
+            }
+            DaemonResponse::Error { message, .. } => bail!("{message}"),
+            _ => bail!("Unexpected daemon response"),
+        }
+        Ok(())
+    }
+
+    pub fn queue_list(&self) -> Result<()> {
+        let client = self.ensure_daemon()?;
+        let status = client.get_status()?;
+
+        if status.queue.is_empty() {
+            println!("Queue is empty.");
+            return Ok(());
+        }
+
+        println!("Queue ({} tracks):", status.queue.len());
+        for (i, track) in status.queue.iter().enumerate() {
+            let marker = if i == status.queue_index { "*" } else { " " };
+            println!(
+                "{} {:3}. {} ({})",
+                marker,
+                i + 1,
+                track.display_name(),
+                track.format_duration()
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn queue_clear(&self) -> Result<()> {
+        let client = self.ensure_daemon()?;
+        match client.queue_clear()? {
+            DaemonResponse::Ok => {
+                println!("Queue cleared.");
+            }
+            DaemonResponse::Error { message, .. } => bail!("{message}"),
+            _ => bail!("Unexpected daemon response"),
+        }
+        Ok(())
+    }
+
+    pub fn shuffle(&self, mode: Option<&str>) -> Result<()> {
+        let client = self.ensure_daemon()?;
+
+        if let Some(mode) = mode {
+            let enabled = parse_toggle_mode(mode)?;
+            match client.set_shuffle(enabled)? {
+                DaemonResponse::Ok => {
+                    println!("Shuffle: {}", if enabled { "on" } else { "off" });
+                }
+                DaemonResponse::Error { message, .. } => bail!("{message}"),
+                _ => bail!("Unexpected daemon response"),
+            }
+            return Ok(());
+        }
+
+        let status = client.get_status()?;
+        println!("Shuffle: {}", if status.shuffle { "on" } else { "off" });
+        Ok(())
+    }
+
+    pub fn repeat(&self, mode: Option<&str>) -> Result<()> {
+        let client = self.ensure_daemon()?;
+
+        if let Some(mode) = mode {
+            let repeat_mode = parse_repeat_mode(mode)?;
+            match client.set_repeat(repeat_mode)? {
+                DaemonResponse::Ok => {
+                    println!("Repeat: {}", repeat_mode);
+                }
+                DaemonResponse::Error { message, .. } => bail!("{message}"),
+                _ => bail!("Unexpected daemon response"),
+            }
+            return Ok(());
+        }
+
+        let status = client.get_status()?;
+        println!("Repeat: {}", status.repeat);
+        Ok(())
+    }
+
+    pub fn playlist_create(&self, name: &str) -> Result<()> {
+        if self.db.get_playlist_by_name(name)?.is_some() {
+            bail!("Playlist already exists: {name}");
+        }
+
+        let playlist = Playlist::new(name.to_string());
+        self.db.insert_playlist(&playlist)?;
+        println!("Created playlist: {name}");
+        Ok(())
+    }
+
+    pub fn playlist_add(&self, playlist_name: &str, query: &str) -> Result<()> {
+        let playlist = self
+            .db
+            .get_playlist_by_name(playlist_name)?
+            .with_context(|| format!("Playlist not found: {playlist_name}"))?;
+        let track = self.find_track(query)?;
+
+        self.db.add_track_to_playlist(&playlist.id, &track.id)?;
+        println!(
+            "Added '{}' to playlist '{}'.",
+            track.display_name(),
+            playlist.name
+        );
+        Ok(())
+    }
+
+    pub fn playlist_remove(&self, playlist_name: &str, query: &str) -> Result<()> {
+        let playlist = self
+            .db
+            .get_playlist_by_name(playlist_name)?
+            .with_context(|| format!("Playlist not found: {playlist_name}"))?;
+        let track = self.find_track(query)?;
+
+        self.db
+            .remove_track_from_playlist(&playlist.id, &track.id)?;
+        println!(
+            "Removed '{}' from playlist '{}'.",
+            track.display_name(),
+            playlist.name
+        );
+        Ok(())
+    }
+
+    pub fn playlist_list(&self) -> Result<()> {
+        let playlists = self.db.get_all_playlists()?;
+        if playlists.is_empty() {
+            println!("No playlists found.");
+            return Ok(());
+        }
+
+        println!("Playlists ({}):", playlists.len());
+        for playlist in playlists {
+            let track_count = self.db.get_playlist_track_count(&playlist.id)?;
+            println!("- {} ({} tracks)", playlist.name, track_count);
+        }
+        Ok(())
+    }
+
+    pub fn playlist_delete(&self, name: &str) -> Result<()> {
+        let playlist = self
+            .db
+            .get_playlist_by_name(name)?
+            .with_context(|| format!("Playlist not found: {name}"))?;
+        self.db.delete_playlist(&playlist.id)?;
+        println!("Deleted playlist: {}", playlist.name);
         Ok(())
     }
 
@@ -476,6 +713,23 @@ fn parse_time(s: &str) -> Result<u64> {
 
     s.parse()
         .context("Invalid time format. Use seconds or MM:SS")
+}
+
+fn parse_toggle_mode(mode: &str) -> Result<bool> {
+    match mode.to_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => bail!("Invalid mode: {mode}. Expected 'on' or 'off'"),
+    }
+}
+
+fn parse_repeat_mode(mode: &str) -> Result<RepeatMode> {
+    mode.parse::<RepeatMode>()
+        .map_err(|e| anyhow::anyhow!("{}. Expected 'off', 'one', or 'all'", e))
+}
+
+fn is_playlist_url(url: &str) -> bool {
+    url.contains("list=") || url.ends_with(".m3u") || url.ends_with(".m3u8")
 }
 
 fn format_duration(seconds: u64) -> String {

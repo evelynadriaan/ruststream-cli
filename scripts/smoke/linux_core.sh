@@ -26,8 +26,11 @@ cargo run -- play smoke-track
 echo "[smoke] checking status"
 cargo run -- status
 
+echo "[smoke] streaming fixed URL via mpv"
+cargo run -- stream "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+sleep 5
+
 echo "[smoke] stopping daemon"
 cargo run -- daemon stop
 
 echo "[smoke] done"
-

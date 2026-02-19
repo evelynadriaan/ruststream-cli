@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 use crate::models::{PlaybackState, RepeatMode, Track};
 
 pub const PROTOCOL_VERSION: u16 = 1;
+const CONNECT_RETRIES: u8 = 4;
+const CONNECT_RETRY_BASE_MS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -22,6 +25,9 @@ pub enum DaemonErrorCode {
     AudioInitFailed,
     AudioPlayFailed,
     DbError,
+    MpvUnavailable,
+    MpvIpcError,
+    MpvLoadFailed,
     InternalError,
 }
 
@@ -69,6 +75,13 @@ pub enum DaemonCommand {
         track: Track,
     },
     QueueClear,
+    Stream {
+        url: String,
+    },
+    StreamPlaylist {
+        url: String,
+    },
+    SaveCurrentStream,
     GetStatus,
     Shutdown,
 }
@@ -114,15 +127,46 @@ impl DaemonClient {
         use interprocess::local_socket::GenericFilePath;
         use interprocess::local_socket::prelude::*;
 
-        let path = self.socket_path.as_os_str();
-        let name = path
-            .to_fs_name::<GenericFilePath>()
-            .with_context(|| "Invalid socket path")?;
+        let mut conn = None;
+        let mut last_connect_error = None;
+        for attempt in 1..=CONNECT_RETRIES {
+            let path = self.socket_path.as_os_str();
+            let name = path
+                .to_fs_name::<GenericFilePath>()
+                .with_context(|| "Invalid socket path")?;
 
-        let conn = interprocess::local_socket::Stream::connect(name).with_context(|| {
+            match interprocess::local_socket::Stream::connect(name) {
+                Ok(c) => {
+                    conn = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    let delay = Duration::from_millis(
+                        CONNECT_RETRY_BASE_MS * (1_u64 << (attempt.saturating_sub(1) as u32)),
+                    );
+                    warn!(
+                        socket_path = %self.socket_path.display(),
+                        attempt,
+                        max_attempts = CONNECT_RETRIES,
+                        retry_in_ms = delay.as_millis(),
+                        error = %e,
+                        "Daemon connect attempt failed"
+                    );
+                    last_connect_error = Some(e);
+                    if attempt < CONNECT_RETRIES {
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
+
+        let conn = conn.with_context(|| {
             format!(
-                "Failed to connect to daemon at {}",
-                self.socket_path.display()
+                "Failed to connect to daemon at {}: {}",
+                self.socket_path.display(),
+                last_connect_error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string())
             )
         })?;
 
@@ -158,6 +202,11 @@ impl DaemonClient {
         {
             *code = envelope.error_code;
         }
+
+        debug!(
+            socket_path = %self.socket_path.display(),
+            "Daemon command completed"
+        );
 
         Ok(response)
     }
@@ -224,6 +273,18 @@ impl DaemonClient {
         self.send_command(DaemonCommand::QueueClear)
     }
 
+    pub fn stream(&self, url: String) -> Result<DaemonResponse> {
+        self.send_command(DaemonCommand::Stream { url })
+    }
+
+    pub fn stream_playlist(&self, url: String) -> Result<DaemonResponse> {
+        self.send_command(DaemonCommand::StreamPlaylist { url })
+    }
+
+    pub fn save_current_stream(&self) -> Result<DaemonResponse> {
+        self.send_command(DaemonCommand::SaveCurrentStream)
+    }
+
     pub fn get_status(&self) -> Result<PlaybackState> {
         match self.send_command(DaemonCommand::GetStatus)? {
             DaemonResponse::Status(state) => Ok(state),
@@ -240,5 +301,22 @@ impl DaemonClient {
 
     pub fn shutdown(&self) -> Result<DaemonResponse> {
         self.send_command(DaemonCommand::Shutdown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn ipc_failure_on_non_socket_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_socket_path = temp.path().join("not-a-socket");
+        fs::write(&fake_socket_path, b"plain-file").unwrap();
+
+        let client = DaemonClient::new(&fake_socket_path);
+        let err = client.send_command(DaemonCommand::GetStatus).unwrap_err();
+        assert!(err.to_string().contains("Failed to connect to daemon"));
     }
 }

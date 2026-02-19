@@ -13,7 +13,7 @@ use clap::Parser;
 use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 
-use cli::{App, Cli, Commands, DaemonCommands};
+use cli::{App, Cli, Commands, DaemonCommands, PlaylistCommands, QueueCommands};
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -72,6 +72,52 @@ fn main() -> Result<()> {
         Commands::Status => {
             app.status()?;
         }
+        Commands::Stream { url } => {
+            app.stream(&url)?;
+        }
+        Commands::Save => {
+            app.save()?;
+        }
+        Commands::Next => {
+            app.next()?;
+        }
+        Commands::Prev => {
+            app.prev()?;
+        }
+        Commands::Queue { command } => match command {
+            QueueCommands::Add { query } => {
+                app.queue_add(&query)?;
+            }
+            QueueCommands::List => {
+                app.queue_list()?;
+            }
+            QueueCommands::Clear => {
+                app.queue_clear()?;
+            }
+        },
+        Commands::Shuffle { mode } => {
+            app.shuffle(mode.as_deref())?;
+        }
+        Commands::Repeat { mode } => {
+            app.repeat(mode.as_deref())?;
+        }
+        Commands::Playlist { command } => match command {
+            PlaylistCommands::Create { name } => {
+                app.playlist_create(&name)?;
+            }
+            PlaylistCommands::Add { playlist, query } => {
+                app.playlist_add(&playlist, &query)?;
+            }
+            PlaylistCommands::Remove { playlist, query } => {
+                app.playlist_remove(&playlist, &query)?;
+            }
+            PlaylistCommands::List => {
+                app.playlist_list()?;
+            }
+            PlaylistCommands::Delete { name } => {
+                app.playlist_delete(&name)?;
+            }
+        },
         Commands::Daemon { command } => match command {
             DaemonCommands::Start => {
                 app.daemon_start()?;

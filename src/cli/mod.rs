@@ -68,6 +68,47 @@ pub enum Commands {
     /// Show current playback status
     Status,
 
+    /// Stream a YouTube URL or playlist via mpv without saving
+    Stream {
+        /// URL to stream
+        url: String,
+    },
+
+    /// Save the currently streaming track to the library in background
+    Save,
+
+    /// Skip to the next track in the queue
+    Next,
+
+    /// Return to the previous track in the queue
+    Prev,
+
+    /// Queue management
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommands,
+    },
+
+    /// Set or show shuffle mode
+    Shuffle {
+        /// Shuffle mode (on/off)
+        #[arg(value_parser = ["on", "off"])]
+        mode: Option<String>,
+    },
+
+    /// Set or show repeat mode
+    Repeat {
+        /// Repeat mode (off/one/all)
+        #[arg(value_parser = ["off", "one", "all"])]
+        mode: Option<String>,
+    },
+
+    /// Playlist management
+    Playlist {
+        #[command(subcommand)]
+        command: PlaylistCommands,
+    },
+
     /// Daemon management
     Daemon {
         #[command(subcommand)]
@@ -105,4 +146,47 @@ pub enum DaemonCommands {
     Status,
     /// Run daemon in foreground (internal use)
     Run,
+}
+
+#[derive(Subcommand)]
+pub enum QueueCommands {
+    /// Add a track to the queue
+    Add {
+        /// Track name, alias, or search query
+        query: String,
+    },
+    /// List queued tracks
+    List,
+    /// Clear queued tracks
+    Clear,
+}
+
+#[derive(Subcommand)]
+pub enum PlaylistCommands {
+    /// Create a playlist
+    Create {
+        /// Playlist name
+        name: String,
+    },
+    /// Add a track to a playlist
+    Add {
+        /// Playlist name
+        playlist: String,
+        /// Track name, alias, or search query
+        query: String,
+    },
+    /// Remove a track from a playlist
+    Remove {
+        /// Playlist name
+        playlist: String,
+        /// Track name, alias, or search query
+        query: String,
+    },
+    /// List playlists
+    List,
+    /// Delete a playlist
+    Delete {
+        /// Playlist name
+        name: String,
+    },
 }

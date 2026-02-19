@@ -5,10 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::audio::AudioPlayer;
+use crate::audio::{
+    AudioBackendError, MpvBackend, PlaybackBackend, RodioBackend, mpv_is_available, mpv_socket_path,
+};
 use crate::config::Config;
+use crate::db::Database;
+use crate::download::Downloader;
 use crate::ipc::{
     DaemonCommand, DaemonErrorCode, DaemonRequestEnvelope, DaemonResponse, DaemonResponseEnvelope,
     PROTOCOL_VERSION,
@@ -19,6 +23,10 @@ use crate::models::{PlaybackState, RepeatMode, Track};
 #[derive(Clone)]
 enum AudioCommand {
     Play(Track),
+    Stream {
+        url: String,
+        response_tx: Sender<std::result::Result<(), AudioBackendError>>,
+    },
     Pause,
     Resume,
     Stop,
@@ -26,6 +34,75 @@ enum AudioCommand {
     Seek(u64),
     CheckFinished(Sender<bool>),
     GetPosition(Sender<u64>),
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamContext {
+    current_stream_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Rodio,
+    Mpv,
+}
+
+struct UnavailableBackend {
+    reason: String,
+}
+
+impl PlaybackBackend for UnavailableBackend {
+    fn play(&mut self, _source: &str) -> std::result::Result<(), AudioBackendError> {
+        Err(AudioBackendError::AudioInit(self.reason.clone()))
+    }
+
+    fn pause(&mut self) -> std::result::Result<(), AudioBackendError> {
+        Err(AudioBackendError::AudioInit(self.reason.clone()))
+    }
+
+    fn resume(&mut self) -> std::result::Result<(), AudioBackendError> {
+        Err(AudioBackendError::AudioInit(self.reason.clone()))
+    }
+
+    fn stop(&mut self) -> std::result::Result<(), AudioBackendError> {
+        Ok(())
+    }
+
+    fn seek(
+        &mut self,
+        _position: std::time::Duration,
+    ) -> std::result::Result<bool, AudioBackendError> {
+        Err(AudioBackendError::AudioInit(self.reason.clone()))
+    }
+
+    fn get_position(&mut self) -> std::result::Result<std::time::Duration, AudioBackendError> {
+        Err(AudioBackendError::AudioInit(self.reason.clone()))
+    }
+
+    fn set_volume(&mut self, _volume: u8) -> std::result::Result<(), AudioBackendError> {
+        Err(AudioBackendError::AudioInit(self.reason.clone()))
+    }
+
+    fn is_finished(&mut self) -> std::result::Result<bool, AudioBackendError> {
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackLifecycle {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+#[derive(Debug, Clone)]
+enum PlaybackEvent {
+    Start(Track),
+    Pause,
+    Resume,
+    Stop,
+    Finished,
+    Error,
 }
 
 pub struct Daemon {
@@ -42,15 +119,13 @@ impl Daemon {
         use interprocess::local_socket::{GenericFilePath, ListenerOptions};
 
         let socket_path = self.config.socket_path();
+        let pid_path = self.config.pid_path();
 
-        // Remove stale socket
-        if socket_path.exists() {
-            fs::remove_file(&socket_path)?;
-        }
+        cleanup_stale_runtime_files(&self.config)?;
 
         // Write PID file
-        let pid_path = self.config.pid_path();
-        fs::write(&pid_path, std::process::id().to_string())?;
+        fs::write(&pid_path, std::process::id().to_string())
+            .with_context(|| format!("Failed to write pid file at {}", pid_path.display()))?;
 
         // Create listener
         let name = socket_path.as_os_str().to_fs_name::<GenericFilePath>()?;
@@ -59,11 +134,16 @@ impl Daemon {
             .create_sync()
             .with_context(|| "Failed to create socket listener")?;
 
-        info!("Daemon started, listening on {}", socket_path.display());
+        info!(
+            socket_path = %socket_path.display(),
+            pid_path = %pid_path.display(),
+            "Daemon started"
+        );
 
         // Shared state
         let state = Arc::new(Mutex::new(PlaybackState::new()));
         state.lock().unwrap().volume = self.config.playback.default_volume;
+        let stream_context = Arc::new(Mutex::new(StreamContext::default()));
 
         let running = Arc::new(AtomicBool::new(true));
 
@@ -74,8 +154,15 @@ impl Daemon {
         let audio_running = Arc::clone(&running);
         let audio_state = Arc::clone(&state);
         let default_volume = self.config.playback.default_volume;
+        let audio_config = self.config.clone();
         thread::spawn(move || {
-            run_audio_thread(audio_rx, audio_state, audio_running, default_volume);
+            run_audio_thread(
+                audio_rx,
+                audio_state,
+                audio_running,
+                default_volume,
+                audio_config,
+            );
         });
 
         // Spawn playback monitor thread
@@ -105,23 +192,29 @@ impl Daemon {
         while running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok(conn) => {
-                    let response = handle_connection(conn, &state, &running, &audio_tx);
+                    debug!("Accepted IPC connection");
+                    let response = handle_connection(
+                        conn,
+                        &state,
+                        &stream_context,
+                        &running,
+                        &audio_tx,
+                        &self.config,
+                    );
 
                     if let Err(e) = response {
-                        error!("Connection error: {e}");
+                        error!(error = %e, "IPC connection handling failed");
                     }
                 }
                 Err(e) => {
                     if running.load(Ordering::SeqCst) {
-                        error!("Accept error: {e}");
+                        error!(error = %e, "IPC accept failed");
                     }
                 }
             }
         }
 
-        // Cleanup
-        let _ = fs::remove_file(&socket_path);
-        let _ = fs::remove_file(&pid_path);
+        cleanup_runtime_files(&self.config);
 
         info!("Daemon stopped");
         Ok(())
@@ -131,12 +224,13 @@ impl Daemon {
         use std::process::Command;
 
         let socket_path = config.socket_path();
+        cleanup_stale_runtime_files(config)?;
+
         if socket_path.exists() {
             let client = crate::ipc::DaemonClient::new(&socket_path);
             if client.is_daemon_running() {
                 anyhow::bail!("Daemon is already running");
             }
-            fs::remove_file(&socket_path)?;
         }
 
         let exe = std::env::current_exe()?;
@@ -158,9 +252,11 @@ impl Daemon {
 
         let client = crate::ipc::DaemonClient::new(&socket_path);
         if client.wait_until_ready(std::time::Duration::from_secs(5)) {
+            info!(socket_path = %socket_path.display(), "Detached daemon is ready");
             return Ok(());
         }
 
+        cleanup_stale_runtime_files(config)?;
         anyhow::bail!("Daemon failed to start")
     }
 
@@ -169,12 +265,14 @@ impl Daemon {
         if client.is_daemon_running() {
             client.shutdown()?;
             for _ in 0..50 {
-                if !config.socket_path().exists() {
+                if !client.is_daemon_running() {
+                    cleanup_runtime_files(config);
                     return Ok(());
                 }
                 thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+        cleanup_stale_runtime_files(config)?;
         Ok(())
     }
 
@@ -294,74 +392,146 @@ fn run_audio_thread(
     state: Arc<Mutex<PlaybackState>>,
     running: Arc<AtomicBool>,
     default_volume: u8,
+    config: Config,
 ) {
-    let player = match AudioPlayer::new() {
-        Ok(p) => {
-            p.set_volume(default_volume);
-            Some(p)
-        }
-        Err(e) => {
-            error!("Failed to initialize audio player: {e}");
-            None
+    let create_rodio_backend = |volume: u8| -> Box<dyn PlaybackBackend> {
+        match RodioBackend::new() {
+            Ok(mut backend) => {
+                let _ = backend.set_volume(volume);
+                Box::new(backend)
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to initialize rodio backend");
+                Box::new(UnavailableBackend {
+                    reason: e.to_string(),
+                })
+            }
         }
     };
 
+    let create_mpv_backend = |volume: u8| -> Box<dyn PlaybackBackend> {
+        let mut backend = MpvBackend::new(mpv_socket_path(config.data_dir()));
+        let _ = backend.set_volume(volume);
+        Box::new(backend)
+    };
+
+    let mut backend_kind = BackendKind::Rodio;
+    let mut backend: Box<dyn PlaybackBackend> = create_rodio_backend(default_volume);
+    let mut current_volume = default_volume;
+
     while running.load(Ordering::SeqCst) {
         match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(cmd) => {
-                if let Some(ref p) = player {
-                    match cmd {
-                        AudioCommand::Play(track) => {
-                            let path = std::path::Path::new(&track.file_path);
-                            if let Err(e) = p.play_file(path) {
-                                error!("Failed to play: {e}");
-                                state.lock().unwrap().is_playing = false;
-                            } else {
-                                let mut s = state.lock().unwrap();
-                                s.current_track = Some(track);
-                                s.is_playing = true;
-                                s.position = 0;
-                            }
+            Ok(cmd) => match cmd {
+                AudioCommand::Play(track) => {
+                    if backend_kind != BackendKind::Rodio {
+                        let _ = backend.stop();
+                        backend = create_rodio_backend(current_volume);
+                        backend_kind = BackendKind::Rodio;
+                    }
+
+                    if let Err(e) = backend.play(&track.file_path) {
+                        error!(error = %e, file_path = %track.file_path, "Failed to play track");
+                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Error);
+                    } else {
+                        apply_playback_transition(
+                            &mut state.lock().unwrap(),
+                            PlaybackEvent::Start(track),
+                        );
+                    }
+                }
+                AudioCommand::Stream { url, response_tx } => {
+                    if backend_kind != BackendKind::Mpv {
+                        let _ = backend.stop();
+                        backend = create_mpv_backend(current_volume);
+                        backend_kind = BackendKind::Mpv;
+                    }
+
+                    let result = match backend.play(&url) {
+                        Ok(_) => {
+                            apply_playback_transition(
+                                &mut state.lock().unwrap(),
+                                PlaybackEvent::Start(stream_track(&url)),
+                            );
+                            Ok(())
                         }
-                        AudioCommand::Pause => {
-                            p.pause();
-                            state.lock().unwrap().is_playing = false;
+                        Err(e) => {
+                            error!(error = %e, url = %url, "Failed to stream URL");
+                            apply_playback_transition(
+                                &mut state.lock().unwrap(),
+                                PlaybackEvent::Error,
+                            );
+                            Err(e)
                         }
-                        AudioCommand::Resume => {
-                            p.resume();
-                            state.lock().unwrap().is_playing = true;
+                    };
+                    let _ = response_tx.send(result);
+                }
+                AudioCommand::Pause => {
+                    if let Err(e) = backend.pause() {
+                        error!(error = %e, "Pause failed on active backend");
+                    } else {
+                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Pause);
+                    }
+                }
+                AudioCommand::Resume => {
+                    if let Err(e) = backend.resume() {
+                        error!(error = %e, "Resume failed on active backend");
+                    } else {
+                        apply_playback_transition(
+                            &mut state.lock().unwrap(),
+                            PlaybackEvent::Resume,
+                        );
+                    }
+                }
+                AudioCommand::Stop => {
+                    if let Err(e) = backend.stop() {
+                        error!(error = %e, "Stop failed on active backend");
+                    }
+                    apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Stop);
+                }
+                AudioCommand::SetVolume(vol) => {
+                    current_volume = vol;
+                    if let Err(e) = backend.set_volume(vol) {
+                        error!(error = %e, "Set volume failed on active backend");
+                    }
+                    state.lock().unwrap().volume = vol;
+                }
+                AudioCommand::Seek(position) => {
+                    let duration = std::time::Duration::from_secs(position);
+                    match backend.seek(duration) {
+                        Ok(true) => {
+                            state.lock().unwrap().position = position;
                         }
-                        AudioCommand::Stop => {
-                            p.stop();
-                            let mut s = state.lock().unwrap();
-                            s.is_playing = false;
-                            s.current_track = None;
-                            s.position = 0;
-                        }
-                        AudioCommand::SetVolume(vol) => {
-                            p.set_volume(vol);
-                            state.lock().unwrap().volume = vol;
-                        }
-                        AudioCommand::Seek(position) => {
-                            let duration = std::time::Duration::from_secs(position);
-                            if p.seek(duration) {
-                                state.lock().unwrap().position = position;
-                            }
-                        }
-                        AudioCommand::CheckFinished(response_tx) => {
-                            let _ = response_tx.send(p.is_finished());
-                        }
-                        AudioCommand::GetPosition(response_tx) => {
-                            let pos = p.get_position().as_secs();
-                            let _ = response_tx.send(pos);
+                        Ok(false) => {}
+                        Err(e) => {
+                            error!(error = %e, position, "Seek failed on active backend");
                         }
                     }
                 }
-            }
+                AudioCommand::CheckFinished(response_tx) => {
+                    let finished = backend.is_finished().unwrap_or_else(|e| {
+                        error!(error = %e, "is_finished failed on active backend");
+                        false
+                    });
+                    let _ = response_tx.send(finished);
+                }
+                AudioCommand::GetPosition(response_tx) => {
+                    let pos = backend.get_position().unwrap_or_else(|e| {
+                        error!(error = %e, "get_position failed on active backend");
+                        std::time::Duration::from_secs(0)
+                    });
+                    let _ = response_tx.send(pos.as_secs());
+                }
+            },
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn stream_track(url: &str) -> Track {
+    let mut track = Track::new(url.to_string(), url.to_string(), 0, String::new());
+    track.available = false;
+    track
 }
 
 fn playback_monitor(
@@ -398,11 +568,7 @@ fn playback_monitor(
                 .unwrap_or(false);
 
         if finished {
-            let mut s = state.lock().unwrap();
-            // Track finished, stop playback
-            s.is_playing = false;
-            s.current_track = None;
-            s.position = 0;
+            apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Finished);
         }
     }
 }
@@ -410,8 +576,10 @@ fn playback_monitor(
 fn handle_connection(
     conn: interprocess::local_socket::Stream,
     state: &Arc<Mutex<PlaybackState>>,
+    stream_context: &Arc<Mutex<StreamContext>>,
     running: &Arc<AtomicBool>,
     audio_tx: &Sender<AudioCommand>,
+    config: &Config,
 ) -> Result<()> {
     let mut reader = BufReader::new(&conn);
     let mut writer = &conn;
@@ -430,7 +598,14 @@ fn handle_connection(
                     ),
                 )
             } else {
-                handle_command(request.command, state, running, audio_tx)
+                handle_command(
+                    request.command,
+                    state,
+                    stream_context,
+                    running,
+                    audio_tx,
+                    config,
+                )
             }
         }
         Err(e) => error_response(
@@ -449,11 +624,14 @@ fn handle_connection(
 fn handle_command(
     command: DaemonCommand,
     state: &Arc<Mutex<PlaybackState>>,
+    stream_context: &Arc<Mutex<StreamContext>>,
     running: &Arc<AtomicBool>,
     audio_tx: &Sender<AudioCommand>,
+    config: &Config,
 ) -> DaemonResponseEnvelope {
     match command {
         DaemonCommand::Play { track } => {
+            stream_context.lock().unwrap().current_stream_url = None;
             if audio_tx.send(AudioCommand::Play(track)).is_ok() {
                 ok_response(DaemonResponse::Ok)
             } else {
@@ -482,6 +660,7 @@ fn handle_command(
                 s.queue = tracks;
                 s.queue_index = idx;
             }
+            stream_context.lock().unwrap().current_stream_url = None;
 
             if audio_tx.send(AudioCommand::Play(track)).is_ok() {
                 ok_response(DaemonResponse::Ok)
@@ -501,6 +680,7 @@ fn handle_command(
             ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::Stop => {
+            stream_context.lock().unwrap().current_stream_url = None;
             let _ = audio_tx.send(AudioCommand::Stop);
             ok_response(DaemonResponse::Ok)
         }
@@ -597,14 +777,135 @@ fn handle_command(
             s.queue_index = 0;
             ok_response(DaemonResponse::Ok)
         }
+        DaemonCommand::Stream { url } => {
+            handle_stream_request(url, false, state, stream_context, audio_tx)
+        }
+        DaemonCommand::StreamPlaylist { url } => {
+            handle_stream_request(url, true, state, stream_context, audio_tx)
+        }
+        DaemonCommand::SaveCurrentStream => {
+            if !mpv_is_available() {
+                return error_response(
+                    DaemonErrorCode::MpvUnavailable,
+                    "mpv is not installed. Install mpv to use stream/save commands.".to_string(),
+                );
+            }
+
+            let Some(stream_url) = stream_context.lock().unwrap().current_stream_url.clone() else {
+                return error_response(
+                    DaemonErrorCode::TrackNotFound,
+                    "No active stream to save".to_string(),
+                );
+            };
+
+            let config_clone = config.clone();
+            thread::spawn(move || {
+                save_stream_to_library(config_clone, stream_url);
+            });
+
+            ok_response(DaemonResponse::Ok)
+        }
         DaemonCommand::GetStatus => {
             let s = state.lock().unwrap().clone();
             ok_response(DaemonResponse::Status(s))
         }
         DaemonCommand::Shutdown => {
+            stream_context.lock().unwrap().current_stream_url = None;
             running.store(false, Ordering::SeqCst);
             let _ = audio_tx.send(AudioCommand::Stop);
             ok_response(DaemonResponse::Ok)
+        }
+    }
+}
+
+fn handle_stream_request(
+    url: String,
+    is_playlist: bool,
+    state: &Arc<Mutex<PlaybackState>>,
+    stream_context: &Arc<Mutex<StreamContext>>,
+    audio_tx: &Sender<AudioCommand>,
+) -> DaemonResponseEnvelope {
+    let (response_tx, response_rx) = mpsc::channel();
+    if audio_tx
+        .send(AudioCommand::Stream {
+            url: url.clone(),
+            response_tx,
+        })
+        .is_err()
+    {
+        return error_response(
+            DaemonErrorCode::InternalError,
+            "Audio thread not running".to_string(),
+        );
+    }
+
+    match response_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(())) => {
+            {
+                let mut s = state.lock().unwrap();
+                s.queue.clear();
+                s.queue_index = 0;
+            }
+            stream_context.lock().unwrap().current_stream_url = Some(url.clone());
+            if is_playlist {
+                info!(url = %url, "Streaming playlist via mpv");
+            } else {
+                info!(url = %url, "Streaming URL via mpv");
+            }
+            ok_response(DaemonResponse::Ok)
+        }
+        Ok(Err(err)) => {
+            let (code, message) = map_audio_error_to_daemon(err);
+            error_response(code, message)
+        }
+        Err(_) => error_response(
+            DaemonErrorCode::InternalError,
+            "Timed out waiting for audio thread response".to_string(),
+        ),
+    }
+}
+
+fn map_audio_error_to_daemon(err: AudioBackendError) -> (DaemonErrorCode, String) {
+    match err {
+        AudioBackendError::MpvUnavailable => (
+            DaemonErrorCode::MpvUnavailable,
+            "mpv is not installed. Install mpv to use stream/save commands.".to_string(),
+        ),
+        AudioBackendError::MpvIpcError(message) => (DaemonErrorCode::MpvIpcError, message),
+        AudioBackendError::MpvLoadFailed(message) => (DaemonErrorCode::MpvLoadFailed, message),
+        AudioBackendError::AudioPlay(message) => (DaemonErrorCode::AudioPlayFailed, message),
+        AudioBackendError::AudioInit(message) => (DaemonErrorCode::AudioInitFailed, message),
+    }
+}
+
+fn save_stream_to_library(config: Config, stream_url: String) {
+    if let Err(e) = Downloader::check_dependencies() {
+        warn!(error = %e, "Skipping stream save due to missing downloader dependency");
+        return;
+    }
+
+    let downloader = Downloader::new(config.clone());
+    match downloader.download(&stream_url, |_| {}) {
+        Ok(track) => match Database::open(&config.db_path()) {
+            Ok(db) => {
+                let already_exists = db.get_track_by_url(&track.url).ok().flatten().is_some();
+                if !already_exists {
+                    if let Err(e) = db.insert_track(&track) {
+                        warn!(error = %e, "Failed to persist saved stream track");
+                    } else {
+                        info!(track = %track.title, "Saved stream track to library");
+                        // TODO(streaming-v2): switch to local rodio playback after save completes, with position handoff
+                    }
+                } else {
+                    info!(track = %track.title, "Saved stream track already exists in library");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to open database for stream save");
+            }
+        },
+        Err(e) => {
+            warn!(error = %e, url = %stream_url, "Failed to download current stream");
         }
     }
 }
@@ -618,6 +919,7 @@ fn ok_response(response: DaemonResponse) -> DaemonResponseEnvelope {
 }
 
 fn error_response(code: DaemonErrorCode, message: String) -> DaemonResponseEnvelope {
+    debug!(?code, message = %message, "Returning daemon error response");
     DaemonResponseEnvelope {
         protocol_version: PROTOCOL_VERSION,
         response: DaemonResponse::Error {
@@ -626,4 +928,110 @@ fn error_response(code: DaemonErrorCode, message: String) -> DaemonResponseEnvel
         },
         error_code: Some(code),
     }
+}
+
+fn derive_playback_lifecycle(state: &PlaybackState) -> PlaybackLifecycle {
+    match (state.current_track.is_some(), state.is_playing) {
+        (false, _) => PlaybackLifecycle::Stopped,
+        (true, true) => PlaybackLifecycle::Playing,
+        (true, false) => PlaybackLifecycle::Paused,
+    }
+}
+
+fn apply_playback_transition(state: &mut PlaybackState, event: PlaybackEvent) {
+    let current = derive_playback_lifecycle(state);
+
+    match (current, event) {
+        (_, PlaybackEvent::Stop | PlaybackEvent::Finished | PlaybackEvent::Error) => {
+            state.is_playing = false;
+            state.current_track = None;
+            state.position = 0;
+        }
+        (_, PlaybackEvent::Start(track)) => {
+            state.current_track = Some(track);
+            state.is_playing = true;
+            state.position = 0;
+        }
+        (PlaybackLifecycle::Playing, PlaybackEvent::Pause) => {
+            state.is_playing = false;
+        }
+        (PlaybackLifecycle::Paused, PlaybackEvent::Resume) => {
+            state.is_playing = true;
+        }
+        (PlaybackLifecycle::Stopped, PlaybackEvent::Pause | PlaybackEvent::Resume) => {
+            warn!(lifecycle = ?current, "Ignoring invalid playback transition on stopped state");
+        }
+        (PlaybackLifecycle::Playing, PlaybackEvent::Resume) => {
+            debug!("Playback already in Playing state");
+        }
+        (PlaybackLifecycle::Paused, PlaybackEvent::Pause) => {
+            debug!("Playback already in Paused state");
+        }
+    }
+}
+
+fn cleanup_runtime_files(config: &Config) {
+    let socket_path = config.socket_path();
+    let pid_path = config.pid_path();
+
+    if socket_path.exists()
+        && let Err(e) = fs::remove_file(&socket_path)
+    {
+        warn!(
+            socket_path = %socket_path.display(),
+            error = %e,
+            "Failed to remove socket file during cleanup"
+        );
+    }
+    if pid_path.exists()
+        && let Err(e) = fs::remove_file(&pid_path)
+    {
+        warn!(
+            pid_path = %pid_path.display(),
+            error = %e,
+            "Failed to remove pid file during cleanup"
+        );
+    }
+}
+
+fn cleanup_stale_runtime_files(config: &Config) -> Result<()> {
+    let socket_path = config.socket_path();
+    let pid_path = config.pid_path();
+
+    if socket_path.exists() {
+        let client = crate::ipc::DaemonClient::new(&socket_path);
+        if !client.is_daemon_running() {
+            warn!(
+                socket_path = %socket_path.display(),
+                "Removing stale daemon socket"
+            );
+            fs::remove_file(&socket_path).with_context(|| {
+                format!(
+                    "Failed to remove stale socket file at {}",
+                    socket_path.display()
+                )
+            })?;
+        }
+    }
+
+    if pid_path.exists() {
+        let stale_pid = fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|pid| !is_pid_alive(pid))
+            .unwrap_or(true);
+
+        if stale_pid {
+            warn!(pid_path = %pid_path.display(), "Removing stale daemon pid file");
+            fs::remove_file(&pid_path).with_context(|| {
+                format!("Failed to remove stale pid file at {}", pid_path.display())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }

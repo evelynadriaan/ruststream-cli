@@ -18,7 +18,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev ffmpeg yt-dlp
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev ffmpeg yt-dlp mpv
 
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
@@ -37,7 +37,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev mpv
 
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
@@ -68,7 +68,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev
+          sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev mpv
 
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly

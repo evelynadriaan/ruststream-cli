@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="${CLISTREAM_REPO:-SoItGoesIO/mixyt}"
+REPO="${CLISTREAM_REPO:-evelynadriaan/ruststream-cli}"
 INSTALL_DIR="${CLISTREAM_INSTALL_DIR:-/usr/local/bin}"
 
 OS="$(uname -s)"
@@ -30,6 +30,10 @@ fi
 if ! command -v yt-dlp >/dev/null 2>&1; then
     echo "Missing dependency: yt-dlp"
     exit 1
+fi
+
+if ! command -v mpv >/dev/null 2>&1; then
+    echo "Warning: mpv is not installed. Streaming commands (stream/save) will be unavailable."
 fi
 
 if command -v clistream >/dev/null 2>&1; then

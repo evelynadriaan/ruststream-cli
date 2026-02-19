@@ -2,17 +2,27 @@
 
 ## Project Overview
 
-mixyt is a macOS-only CLI tool for saving and playing YouTube audio from the terminal. It downloads audio via yt-dlp and plays it through a background daemon.
+clistream is a Linux-first CLI tool for saving, managing, and playing YouTube audio from the terminal. It downloads audio via yt-dlp and plays it through a background daemon. macOS is best-effort compile only — never a release or test gate.
+
+**Canonical plan:** `docs/CLISTREAM_MIGRATION_PLAN.md` — read this before making any architectural decisions.
 
 ## Architecture
 
-- **Daemon** (`src/daemon/mod.rs`): Background process that handles audio playback. Communicates via Unix socket IPC.
+- **Daemon** (`src/daemon/mod.rs`): Background process that handles audio playback. Communicates via Unix socket IPC with protocol versioning.
 - **TUI** (`src/tui/mod.rs`): Terminal UI built with ratatui. Connects to daemon as a client.
-- **Audio** (`src/audio/mod.rs`): Wrapper around rodio for playback, seeking, volume control.
-- **CLI** (`src/cli/`): clap-based commands. Running `mixyt` with no args opens the TUI.
-- **DB** (`src/db/mod.rs`): SQLite database storing tracks (title, URL, file path, duration).
-- **IPC** (`src/ipc/mod.rs`): Client for communicating with the daemon over Unix socket.
-- **Downloader** (`src/downloader/mod.rs`): Wraps yt-dlp to fetch video info and download audio.
+- **Audio** (`src/audio/mod.rs`): Wrapper around rodio for local file playback.
+- **CLI** (`src/cli/`): clap-based commands. Running `clistream` with no args and a TTY opens TUI; non-TTY exits with guidance.
+- **DB** (`src/db/mod.rs`): SQLite with schema_migrations table. Version-tracked from day one.
+- **IPC** (`src/ipc/mod.rs`): Versioned envelope (protocol_version=1) with typed error codes over Unix socket.
+- **Downloader** (`src/download/mod.rs`): Wraps yt-dlp to fetch video info and download audio.
+
+## Paths
+
+- Config: `~/.config/clistream/config.toml`
+- Data: `~/.local/share/clistream/`
+- Audio files: `~/.local/share/clistream/audio/`
+- DB: `~/.local/share/clistream/clistream.db`
+- Daemon socket: `$XDG_RUNTIME_DIR/clistream/clistream.sock` (fallback: data dir)
 
 ## Development
 
@@ -31,26 +41,32 @@ cargo run -- help
 cargo test
 
 # Lint
-cargo clippy
+cargo clippy -- -D warnings
 cargo fmt --check
 ```
 
-## External Dependencies
+## External Dependencies (Linux)
 
-Users must have installed: `brew install yt-dlp ffmpeg`
+Runtime: `yt-dlp`, `ffmpeg`
+Build: `pkg-config`, `libasound2-dev`, `libdbus-1-dev`
+
+```bash
+sudo apt-get install -y pkg-config libasound2-dev libdbus-1-dev ffmpeg yt-dlp
+```
 
 ## Key Patterns
 
-- The daemon runs in background and owns the audio player. TUI/CLI are clients.
-- Tracks are stored in `~/.mixyt/tracks/` as audio files, metadata in SQLite at `~/.mixyt/mixyt.db`.
-- IPC uses JSON-serialized commands/responses over Unix socket at `~/.mixyt/daemon.sock`.
+- Daemon owns the audio player. TUI/CLI are IPC clients.
+- All IPC messages use `DaemonRequestEnvelope` / `DaemonResponseEnvelope` with `protocol_version`.
+- DB migrations run at startup via `schema_migrations` table — never run raw DDL outside of migration system.
+- Socket and PID paths resolved via config methods — never hardcoded elsewhere.
 
-## Known Issues
+## Phase Status
 
-- Media key support (souvlaki) is implemented but doesn't work reliably on macOS.
-
-## Release Process
-
-1. Update version in `Cargo.toml`
-2. Commit, tag with `vX.Y.Z`, push both
-3. GitHub Actions builds and creates release with macOS binaries
+- Phase 0 (contracts/bootstrap): complete
+- Phase 1 (Linux PoC): complete
+- Phase 2 (V1 stabilization): complete
+- Phase 3 (delivery/CI/release): complete
+- Phase 4 (reliability optimization): complete
+- Phase 5 (advanced features: next/prev/queue/shuffle/repeat/playlist): complete
+- Phase 6 (YouTube streaming via mpv): complete

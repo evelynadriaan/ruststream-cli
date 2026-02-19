@@ -192,11 +192,139 @@ macOS:
 1. Optional compile-only check.
 2. Never blocks merge or release.
 
-## 11. Definition of Done
+## 11. Phase 6 — YouTube Streaming via mpv (Plan Amendment 2026-02-19)
+
+### 11.1 Decision: mpv subprocess as streaming backend
+
+Streaming backend is **mpv spawned as a subprocess**, controlled via its JSON IPC socket.
+
+Rationale:
+- `yt-dlp --get-url` CDN URLs contain `expire=<unix_timestamp>` and go stale (~6 hours) — unsuitable for playlists or long sessions.
+- yt-dlp pipe → rodio cannot seek without re-spawning the process.
+- mpv has yt-dlp integration built in, handles buffering/seeking/format internally, and exposes a clean JSON IPC socket that mirrors clistream's existing daemon IPC pattern.
+- No compile-time dependency (no `libmpv` crate) — subprocess only, keeping build simple.
+
+### 11.2 Architecture
+
+Add `PlaybackBackend` trait to `src/audio/mod.rs`:
+
+```
+PlaybackBackend (trait)
+  ├── RodioBackend  — local file playback (existing, unchanged)
+  └── MpvBackend    — stream URL playback (new, Phase 6)
+```
+
+Both backends expose: `play`, `pause`, `resume`, `stop`, `seek`, `get_position`, `set_volume`, `is_finished`.
+
+The daemon's audio thread holds whichever backend is active. Switching backends happens on the next play/stream command — no mid-session switch.
+
+`MpvBackend` spawns:
+```
+mpv --no-video --no-terminal --input-ipc-server=<mpv_socket_path> <url>
+```
+
+mpv socket path policy: `dirs::runtime_dir()/clistream/clistream-mpv.sock`, fallback `<data>/clistream-mpv.sock`.
+Same runtime dir fallback policy as main daemon socket.
+
+### 11.3 mpv JSON IPC commands used
+
+```json
+{"command": ["loadfile", "<url>"]}
+{"command": ["set_property", "pause", true]}
+{"command": ["set_property", "pause", false]}
+{"command": ["seek", <seconds>, "absolute"]}
+{"command": ["get_property", "playback-time"]}
+{"command": ["set_property", "volume", <0-100>]}
+{"command": ["quit"]}
+```
+
+mpv responds with `{"data": <value>, "error": "success"}` or `{"error": "<message>"}`.
+
+### 11.4 New CLI commands
+
+```
+clistream stream <url>              # stream single URL via mpv without saving
+clistream stream <playlist-url>     # stream entire YouTube playlist via mpv
+clistream save                      # while streaming: download current track to library in background
+```
+
+`clistream save` behavior:
+- Sends `SaveCurrentStream` IPC command to daemon.
+- Daemon captures the current stream URL and spawns a background `yt-dlp` download thread.
+- Playback continues uninterrupted from mpv while download runs.
+- On download completion, track is added to DB silently.
+- Does NOT switch playback from mpv to rodio after save — stream continues until it ends or user stops.
+- Code must include: `// TODO(streaming-v2): switch to local rodio playback after save completes, with position handoff`
+
+### 11.5 New IPC contract additions
+
+New `DaemonCommand` variants:
+```
+Stream { url: String }
+StreamPlaylist { url: String }
+SaveCurrentStream
+```
+
+New `DaemonErrorCode` variants:
+```
+MPV_UNAVAILABLE       // mpv binary not found at runtime
+MPV_IPC_ERROR         // mpv socket communication failure
+MPV_LOAD_FAILED       // mpv failed to load the URL
+```
+
+`protocol_version` remains `1` — these are additive variants.
+
+### 11.6 Dependency changes
+
+mpv is an **optional runtime dependency** — required only for `stream` commands.
+
+Installer (`install.sh`) dependency checks:
+- Add mpv check after existing yt-dlp/ffmpeg checks.
+- If mpv absent: warn user that streaming is unavailable, do not fail install.
+
+CI (`.github/workflows/ci.yml`):
+- Add `mpv` to Linux apt install block.
+- Streaming integration test gated behind `mpv` presence check.
+
+No new compile-time dependencies. No changes to `Cargo.toml`.
+
+### 11.7 File ownership (Phase 6 agents)
+
+Follows existing ownership map:
+- Agent 5 (CLI): adds `stream`, `save` subcommands in `src/cli/`.
+- Agent 6 (daemon/audio): adds `PlaybackBackend` trait, `MpvBackend`, `SaveCurrentStream` handler in `src/audio/`, `src/daemon/`.
+- Agent 7 (IPC/config): adds new `DaemonCommand` variants and error codes to `src/ipc/mod.rs`.
+- Agent 2 (CI): adds mpv to CI apt install.
+- Agent 4 (installer/docs): adds mpv to installer dependency check and docs.
+- Agent 8 (tests): adds streaming integration tests.
+
+### 11.8 Phase sequencing
+
+Phase 6 executes after Phase 5. Reason: Phase 5 builds queue/playlist infrastructure that `stream <playlist-url>` depends on.
+
+Phase 6 acceptance criteria:
+1. `clistream stream <url>` plays audio on Linux via mpv.
+2. `clistream stream <playlist-url>` streams a YouTube playlist sequentially.
+3. `clistream save` downloads current stream track to library without interrupting playback.
+4. If mpv not installed, all three commands fail with `MPV_UNAVAILABLE` and a clear install message.
+5. `clistream play` (library) and all existing commands unaffected.
+6. Linux CI streaming test green.
+7. Smoke script updated with streaming scenario.
+
+### 11.9 Future intent (not in Phase 6 scope)
+
+- Auto-switch from mpv to rodio after `clistream save` completes, with seek position handoff.
+- `clistream stream` query matching library first, falling back to streaming if not found.
+- Last.fm / ListenBrainz scrobbling for streamed tracks.
+
+---
+
+## 12. Definition of Done
 
 1. `clistream` Linux V1 flow is stable (`add/remove/play/status/daemon/tui`).
 2. Linux CI, smoke tests, and release pipeline are green.
 3. Runtime race and stale socket/pid handling are hardened.
 4. Phase 5 advanced commands are Linux-tested and documented.
-5. No extra engineering work is allocated to mac user optimization.
+5. Phase 6 streaming (`stream`, `save`, playlist streaming) works on Linux via mpv.
+6. No extra engineering work is allocated to mac user optimization.
 
