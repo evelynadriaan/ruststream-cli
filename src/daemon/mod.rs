@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,12 +171,14 @@ impl Daemon {
         let monitor_running = Arc::clone(&running);
         let monitor_audio_tx = audio_tx.clone();
         let monitor_stream_context = Arc::clone(&stream_context);
+        let monitor_db_path = self.config.db_path();
         thread::spawn(move || {
             playback_monitor(
                 monitor_state,
                 monitor_stream_context,
                 monitor_running,
                 monitor_audio_tx,
+                monitor_db_path,
             );
         });
 
@@ -545,16 +548,32 @@ fn playback_monitor(
     stream_context: Arc<Mutex<StreamContext>>,
     running: Arc<AtomicBool>,
     audio_tx: Sender<AudioCommand>,
+    db_path: std::path::PathBuf,
 ) {
+    let db = match Database::open(&db_path) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            warn!(
+                db_path = %db_path.display(),
+                error = %e,
+                "Listen history logging disabled: failed to open database"
+            );
+            None
+        }
+    };
+    let mut active_listen: Option<ActiveListen> = None;
+
     while running.load(Ordering::SeqCst) {
         thread::sleep(std::time::Duration::from_secs(1));
 
-        let should_check = {
-            let s = state.lock().unwrap();
-            s.is_playing && s.current_track.is_some()
-        };
+        let pre_state = state.lock().unwrap().clone();
+        if pre_state.current_track.is_none() {
+            flush_active_listen_event(&db, &mut active_listen);
+            continue;
+        }
+        update_active_listen(&pre_state, &mut active_listen);
 
-        if !should_check {
+        if !pre_state.is_playing {
             continue;
         }
 
@@ -565,6 +584,8 @@ fn playback_monitor(
         {
             state.lock().unwrap().position = pos;
         }
+        let post_state = state.lock().unwrap().clone();
+        update_active_listen(&post_state, &mut active_listen);
 
         // Check if audio finished
         let (tx, rx) = mpsc::channel();
@@ -575,6 +596,8 @@ fn playback_monitor(
                 .unwrap_or(false);
 
         if finished {
+            flush_active_listen_event(&db, &mut active_listen);
+
             enum FinishAction {
                 PlayTrack(Track),
                 StreamUrl(String),
@@ -658,6 +681,60 @@ fn playback_monitor(
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveListen {
+    track_title: String,
+    source: String,
+    started_at: String,
+    duration_played: u64,
+}
+
+fn update_active_listen(state: &PlaybackState, active: &mut Option<ActiveListen>) {
+    let Some(current_track) = state.current_track.as_ref() else {
+        return;
+    };
+
+    let track_title = current_track.display_name().to_string();
+    let source = if state.is_streaming {
+        "stream".to_string()
+    } else {
+        "local".to_string()
+    };
+
+    match active {
+        Some(entry) if entry.track_title == track_title && entry.source == source => {
+            entry.duration_played = state.position;
+        }
+        _ => {
+            *active = Some(ActiveListen {
+                track_title,
+                source,
+                started_at: Utc::now().to_rfc3339(),
+                duration_played: state.position,
+            });
+        }
+    }
+}
+
+fn flush_active_listen_event(db: &Option<Database>, active: &mut Option<ActiveListen>) {
+    let Some(event) = active.take() else {
+        return;
+    };
+
+    let Some(db) = db else {
+        return;
+    };
+
+    if let Err(e) = db.insert_listen_event(
+        &event.track_title,
+        &event.source,
+        &event.started_at,
+        event.duration_played,
+    ) {
+        warn!(error = %e, "Failed to persist listen history event");
     }
 }
 

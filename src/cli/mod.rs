@@ -131,6 +131,13 @@ pub enum Commands {
     /// Check track availability
     Check,
 
+    /// Show local listening history
+    History {
+        /// Maximum number of rows to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+
     /// Launch interactive TUI
     #[command(name = "tui")]
     Tui,

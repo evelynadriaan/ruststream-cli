@@ -70,6 +70,15 @@ pub struct StreamEntry {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenEvent {
+    pub id: String,
+    pub track_title: String,
+    pub source: String,
+    pub started_at: String,
+    pub duration_played: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RepeatMode {
     #[default]

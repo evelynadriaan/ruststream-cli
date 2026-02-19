@@ -142,6 +142,9 @@ fn main() -> Result<()> {
         Commands::Check => {
             app.check()?;
         }
+        Commands::History { limit } => {
+            app.history(limit)?;
+        }
         Commands::Tui => {
             // Ensure daemon is running for playback
             let client = ipc::DaemonClient::new(app.config.socket_path());

@@ -699,6 +699,22 @@ impl App {
 
         Ok(())
     }
+
+    pub fn history(&self, limit: usize) -> Result<()> {
+        let events = self.db.get_listen_history(limit)?;
+        if events.is_empty() {
+            println!("No listening history yet.");
+            return Ok(());
+        }
+
+        for event in events {
+            println!(
+                "{}  {}  {}  ({}s)",
+                event.started_at, event.source, event.track_title, event.duration_played
+            );
+        }
+        Ok(())
+    }
 }
 
 fn parse_time(s: &str) -> Result<u64> {

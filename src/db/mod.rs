@@ -4,9 +4,9 @@ use rusqlite::{Connection, Row, Transaction, params};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::models::{Playlist, PlaylistTrack, Track};
+use crate::models::{ListenEvent, Playlist, PlaylistTrack, Track};
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub struct Database {
     conn: Connection,
@@ -60,7 +60,11 @@ impl Database {
                     .unchecked_transaction()
                     .with_context(|| "Failed to start schema bootstrap transaction")?;
                 apply_migration_1(&tx)?;
-                record_migration(&tx, CURRENT_SCHEMA_VERSION)?;
+                record_migration(&tx, 1)?;
+                if CURRENT_SCHEMA_VERSION >= 2 {
+                    apply_migration_2(&tx)?;
+                    record_migration(&tx, 2)?;
+                }
                 tx.commit()
                     .with_context(|| "Failed to commit schema bootstrap transaction")?;
             }
@@ -72,13 +76,21 @@ impl Database {
                     CURRENT_SCHEMA_VERSION
                 );
             }
-            Some(version) => {
-                anyhow::bail!(
-                    "Unsupported schema version {}. Only {} is currently supported.",
-                    version,
-                    CURRENT_SCHEMA_VERSION
-                );
+            Some(1) => {
+                let tx = self
+                    .conn
+                    .unchecked_transaction()
+                    .with_context(|| "Failed to start schema migration transaction")?;
+                apply_migration_2(&tx)?;
+                record_migration(&tx, 2)?;
+                tx.commit()
+                    .with_context(|| "Failed to commit schema migration transaction")?;
             }
+            Some(version) => anyhow::bail!(
+                "Unsupported schema version {}. Only {} is currently supported.",
+                version,
+                CURRENT_SCHEMA_VERSION
+            ),
         }
 
         Ok(())
@@ -340,6 +352,55 @@ impl Database {
         )?;
         Ok(count as usize)
     }
+
+    pub fn insert_listen_event(
+        &self,
+        track_title: &str,
+        source: &str,
+        started_at: &str,
+        duration_played: u64,
+    ) -> Result<()> {
+        if source != "local" && source != "stream" {
+            anyhow::bail!("Invalid source '{}'. Expected 'local' or 'stream'", source);
+        }
+
+        self.conn.execute(
+            "INSERT INTO listen_log (id, track_id, track_title, source, started_at, duration_played)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                track_title,
+                source,
+                started_at,
+                duration_played as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_listen_history(&self, limit: usize) -> Result<Vec<ListenEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, track_title, source, started_at, duration_played
+             FROM listen_log
+             ORDER BY started_at DESC
+             LIMIT ?1",
+        )?;
+
+        let events = stmt
+            .query_map([limit as i64], |row| {
+                Ok(ListenEvent {
+                    id: row.get(0)?,
+                    track_title: row.get(1)?,
+                    source: row.get(2)?,
+                    started_at: row.get(3)?,
+                    duration_played: row.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(events)
+    }
 }
 
 fn apply_migration_1(tx: &Transaction<'_>) -> Result<()> {
@@ -377,6 +438,23 @@ fn apply_migration_1(tx: &Transaction<'_>) -> Result<()> {
         "#,
     )
     .with_context(|| "Failed to apply schema migration v1")?;
+    Ok(())
+}
+
+fn apply_migration_2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS listen_log (
+            id TEXT PRIMARY KEY,
+            track_id TEXT,
+            track_title TEXT NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('local','stream')),
+            started_at TEXT NOT NULL,
+            duration_played INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .with_context(|| "Failed to apply schema migration v2")?;
     Ok(())
 }
 
