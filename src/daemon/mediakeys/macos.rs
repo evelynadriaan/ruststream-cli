@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-/// Run the macOS media key listener using MediaPlayer framework
-/// This integrates with the system's Now Playing controls
+/// Run the macOS media key listener using MediaPlayer framework.
+/// macOS support is best-effort compile only, not a release target.
 #[allow(dead_code)]
 pub fn run_media_key_listener() -> Result<()> {
     // Note: Full implementation requires Objective-C runtime interaction
@@ -15,7 +15,7 @@ pub fn run_media_key_listener() -> Result<()> {
     // This is a placeholder that can be expanded with full objc2 bindings
     // The complexity of the MediaPlayer framework integration is significant
 
-    tracing::info!("macOS media key support initialized (limited)");
+    tracing::info!("macOS media key listener initialized (best-effort compile path)");
 
     // Keep thread alive
     loop {
@@ -23,7 +23,7 @@ pub fn run_media_key_listener() -> Result<()> {
     }
 }
 
-/// Update Now Playing info on macOS
+/// Update Now Playing info on macOS (best-effort compile path)
 #[allow(dead_code)]
 pub fn update_now_playing(_title: &str, _artist: Option<&str>, _duration: u64) {
     // Would update MPNowPlayingInfoCenter here

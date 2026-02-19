@@ -12,13 +12,13 @@ sudo apt-get install -y ffmpeg yt-dlp
 2. Install latest release binary:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SoItGoesIO/mixyt/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/evelynadriaan/ruststream-cli/main/install.sh | sh
 ```
 
 Installer behavior:
 
 1. Linux-only guard.
-2. Verifies `ffmpeg` and `yt-dlp` are available.
+2. Verifies `ffmpeg` and `yt-dlp` are available, and warns if `mpv` is missing.
 3. Downloads `clistream-linux-x86_64` and matching `.sha256` file.
 4. Verifies checksum before moving binary to `/usr/local/bin/clistream`.
 
@@ -42,4 +42,3 @@ Run:
 ```bash
 ./target/release/clistream help
 ```
-

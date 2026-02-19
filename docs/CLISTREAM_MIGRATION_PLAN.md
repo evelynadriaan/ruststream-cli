@@ -7,15 +7,15 @@ Status: Source of truth for implementation.
 
 1. Linux-first delivery. Linux is the only required platform gate.
 2. macOS is best-effort compile only, never a release/test blocker.
-3. Fresh-start product. No legacy `mixyt` user/data migration work.
+3. Fresh-start product. No legacy pre-migration user/data migration work.
 4. PoC first, then full migration/optimization.
 5. Use one canonical plan file only: this file.
 
 ## 2. Repository and Crate Structure (Decision Complete)
 
-1. Keep current Git repo (`mixyt`) as implementation repo.
+1. Keep current Git repo (`ruststream-cli`) as implementation repo.
 2. Build `clistream` as the root package in this same repo (not a sibling repo, not dual-repo).
-3. Do not keep a dual runtime mode. Old `mixyt` behavior remains only in git history.
+3. Do not keep a dual runtime mode. Old pre-migration behavior remains only in git history.
 4. Target paths in the new app:
 5. Config: `~/.config/clistream/config.toml` (`dirs::config_dir()/clistream/config.toml`).
 6. Data: `~/.local/share/clistream` (`dirs::data_dir()/clistream`).
@@ -121,9 +121,9 @@ Phase 5 commands:
 ## 7. Linux Renaming Tasks That Must Be Explicit
 
 1. Replace hardcoded service identity strings:
-2. `dbus_name: "mixyt"` -> `dbus_name: "clistream"`.
-3. `display_name: "mixyt"` -> `display_name: "clistream"`.
-4. Audit user-facing names in logs/errors/help text for `mixyt` leftovers.
+2. `dbus_name` is `clistream`.
+3. `display_name` is `clistream`.
+4. Audit user-facing names in logs/errors/help text for stale pre-migration leftovers.
 
 ## 8. Multi-Agent File Ownership Map
 
@@ -187,7 +187,7 @@ Linux required gates:
 4. Linux smoke script
 5. Release-target build for Linux artifacts
 
-macOS:
+macOS (best-effort compile only, not a release target):
 
 1. Optional compile-only check.
 2. Never blocks merge or release.
@@ -327,4 +327,3 @@ Phase 6 acceptance criteria:
 4. Phase 5 advanced commands are Linux-tested and documented.
 5. Phase 6 streaming (`stream`, `save`, playlist streaming) works on Linux via mpv.
 6. No extra engineering work is allocated to mac user optimization.
-

@@ -1,15 +1,15 @@
-# mixyt
+# clistream
 
 A command-line tool for saving, managing, and playing YouTube audio.
 
 ## Overview
 
-**mixyt** (mix + YouTube) is a CLI tool that allows developers to build a personal library of audio from YouTube videos. It downloads and stores audio locally, provides organization through playlists, and offers full playback controls including background play and media key integration.
+**clistream** is a CLI tool that allows developers to build a personal library of audio from YouTube videos. It downloads and stores audio locally, provides organization through playlists, and offers full playback controls including background play and media key integration.
 
 ## Target Platforms
 
 - Linux
-- macOS
+- macOS (best-effort compile only, not a release target)
 
 ## Core Features
 
@@ -22,7 +22,7 @@ A command-line tool for saving, managing, and playing YouTube audio.
 - Optional custom alias for quick reference
 
 #### Library Storage
-- Local filesystem storage in a dedicated directory (e.g., `~/.mixyt/`)
+- Local filesystem storage in a dedicated directory (e.g., `~/.local/share/clistream/`)
 - SQLite database for metadata and library state
 - Audio files stored alongside database
 
@@ -60,7 +60,7 @@ A command-line tool for saving, managing, and playing YouTube audio.
 ### 4. Media Key Integration
 
 - Respond to system media keys (play/pause, next, previous)
-- Works on both Linux (via MPRIS/D-Bus) and macOS
+- Works on Linux (via MPRIS/D-Bus). macOS is best-effort compile only.
 - Requires background daemon to be running
 
 ### 5. User Interface
@@ -69,33 +69,33 @@ A command-line tool for saving, managing, and playing YouTube audio.
 Standard command-line interface with subcommands:
 
 ```
-mixyt add <url> [--alias <name>]      # Add track to library
-mixyt remove <query>                   # Remove track from library
-mixyt play <query>                     # Play a track
-mixyt pause                            # Pause playback
-mixyt resume                           # Resume playback
-mixyt stop                             # Stop playback
-mixyt next                             # Skip to next track
-mixyt prev                             # Go to previous track
-mixyt seek <time>                      # Seek to position
-mixyt volume <0-100>                   # Set volume
-mixyt list [--playlist <name>]         # List tracks
-mixyt search <query>                   # Fuzzy search library
-mixyt playlist create <name>           # Create playlist
-mixyt playlist add <playlist> <query>  # Add track to playlist
-mixyt playlist remove <playlist> <query>
-mixyt playlist list                    # List all playlists
-mixyt queue add <query>                # Add to current queue
-mixyt queue list                       # Show current queue
-mixyt queue clear                      # Clear queue
-mixyt shuffle [on|off]                 # Toggle shuffle
-mixyt repeat [off|one|all]             # Set repeat mode
-mixyt status                           # Show current playback status
-mixyt daemon start                     # Start background daemon
-mixyt daemon stop                      # Stop background daemon
-mixyt daemon status                    # Check daemon status
-mixyt export [--file <path>]           # Export library to JSON
-mixyt import <file>                    # Import library from JSON
+clistream add <url> [--alias <name>]      # Add track to library
+clistream remove <query>                   # Remove track from library
+clistream play <query>                     # Play a track
+clistream pause                            # Pause playback
+clistream resume                           # Resume playback
+clistream stop                             # Stop playback
+clistream next                             # Skip to next track
+clistream prev                             # Go to previous track
+clistream seek <time>                      # Seek to position
+clistream volume <0-100>                   # Set volume
+clistream list [--playlist <name>]         # List tracks
+clistream search <query>                   # Fuzzy search library
+clistream playlist create <name>           # Create playlist
+clistream playlist add <playlist> <query>  # Add track to playlist
+clistream playlist remove <playlist> <query>
+clistream playlist list                    # List all playlists
+clistream queue add <query>                # Add to current queue
+clistream queue list                       # Show current queue
+clistream queue clear                      # Clear queue
+clistream shuffle [on|off]                 # Toggle shuffle
+clistream repeat [off|one|all]             # Set repeat mode
+clistream status                           # Show current playback status
+clistream daemon start                     # Start background daemon
+clistream daemon stop                      # Stop background daemon
+clistream daemon status                    # Check daemon status
+clistream export [--file <path>]           # Export library to JSON
+clistream import <file>                    # Import library from JSON
 ```
 
 #### Interactive TUI (Secondary)
@@ -105,7 +105,7 @@ Full-screen terminal interface with:
 - Queue management
 - Keyboard navigation
 
-Launched via: `mixyt tui` or `mixyt -i`
+Launched via: `clistream tui` or `clistream -i`
 
 ### 6. Export & Backup
 
@@ -145,12 +145,12 @@ Launched via: `mixyt tui` or `mixyt -i`
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                      mixyt CLI                          │
+│                    clistream CLI                        │
 │  (subcommands, TUI, communicates with daemon via IPC)   │
 └─────────────────────┬───────────────────────────────────┘
                       │ IPC (Unix socket)
 ┌─────────────────────▼───────────────────────────────────┐
-│                   mixyt daemon                          │
+│                 clistream daemon                        │
 │  - Audio playback engine                                │
 │  - Queue management                                     │
 │  - Media key listener                                   │
@@ -159,10 +159,10 @@ Launched via: `mixyt tui` or `mixyt -i`
                       │
 ┌─────────────────────▼───────────────────────────────────┐
 │                    Storage                              │
-│  ~/.mixyt/                                              │
-│  ├── mixyt.db        (SQLite database)                  │
+│  ~/.local/share/clistream/                              │
+│  ├── clistream.db    (SQLite database)                  │
 │  ├── audio/          (downloaded audio files)           │
-│  └── mixyt.sock      (daemon socket)                    │
+│  └── clistream.sock  (daemon socket)                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -172,7 +172,7 @@ Launched via: `mixyt tui` or `mixyt -i`
 - When a YouTube video becomes unavailable (deleted, private, etc.)
 - Track remains in library but marked as `available: false`
 - User notified when attempting to play unavailable track
-- Periodic health check command: `mixyt check`
+- Periodic health check command: `clistream check`
 
 ### Network Errors
 - Graceful failure with clear error messages
@@ -187,11 +187,11 @@ External tools:
 
 ## Configuration
 
-Config file: `~/.config/mixyt/config.toml`
+Config file: `~/.config/clistream/config.toml`
 
 ```toml
 [storage]
-path = "~/.mixyt"           # Library location
+path = "~/.local/share/clistream" # Library location
 
 [audio]
 format = "opus"             # Preferred audio format
