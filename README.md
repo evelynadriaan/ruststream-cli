@@ -1,4 +1,4 @@
-# clistream
+ # clistream
 
 A CLI tool for saving and playing YouTube audio from the terminal on Linux.
 
