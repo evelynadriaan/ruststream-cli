@@ -17,7 +17,7 @@ use crate::ipc::{
     DaemonCommand, DaemonErrorCode, DaemonRequestEnvelope, DaemonResponse, DaemonResponseEnvelope,
     PROTOCOL_VERSION,
 };
-use crate::models::{PlaybackState, RepeatMode, Track};
+use crate::models::{PlaybackState, RepeatMode, StreamEntry, Track};
 
 // Internal commands for the audio thread
 #[derive(Clone)]
@@ -631,6 +631,12 @@ fn handle_command(
 ) -> DaemonResponseEnvelope {
     match command {
         DaemonCommand::Play { track } => {
+            {
+                let mut s = state.lock().unwrap();
+                s.stream_queue.clear();
+                s.stream_queue_index = 0;
+                s.is_streaming = false;
+            }
             stream_context.lock().unwrap().current_stream_url = None;
             if audio_tx.send(AudioCommand::Play(track)).is_ok() {
                 ok_response(DaemonResponse::Ok)
@@ -659,6 +665,9 @@ fn handle_command(
                 let mut s = state.lock().unwrap();
                 s.queue = tracks;
                 s.queue_index = idx;
+                s.stream_queue.clear();
+                s.stream_queue_index = 0;
+                s.is_streaming = false;
             }
             stream_context.lock().unwrap().current_stream_url = None;
 
@@ -680,11 +689,35 @@ fn handle_command(
             ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::Stop => {
+            {
+                let mut s = state.lock().unwrap();
+                s.stream_queue.clear();
+                s.stream_queue_index = 0;
+                s.is_streaming = false;
+            }
             stream_context.lock().unwrap().current_stream_url = None;
             let _ = audio_tx.send(AudioCommand::Stop);
             ok_response(DaemonResponse::Ok)
         }
         DaemonCommand::Next => {
+            let stream_url = {
+                let mut s = state.lock().unwrap();
+                if s.is_streaming && !s.stream_queue.is_empty() {
+                    s.stream_queue_index = (s.stream_queue_index + 1) % s.stream_queue.len();
+                    Some(s.stream_queue[s.stream_queue_index].url.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(url) = stream_url {
+                if let Some(response) = send_stream_command(audio_tx, url.clone()) {
+                    return response;
+                }
+                stream_context.lock().unwrap().current_stream_url = Some(url);
+                return ok_response(DaemonResponse::Ok);
+            }
+
             let next_track = {
                 let mut s = state.lock().unwrap();
                 if s.queue.is_empty() {
@@ -723,6 +756,28 @@ fn handle_command(
             }
         }
         DaemonCommand::Previous => {
+            let stream_url = {
+                let mut s = state.lock().unwrap();
+                if s.is_streaming && !s.stream_queue.is_empty() {
+                    s.stream_queue_index = if s.stream_queue_index == 0 {
+                        s.stream_queue.len() - 1
+                    } else {
+                        s.stream_queue_index - 1
+                    };
+                    Some(s.stream_queue[s.stream_queue_index].url.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(url) = stream_url {
+                if let Some(response) = send_stream_command(audio_tx, url.clone()) {
+                    return response;
+                }
+                stream_context.lock().unwrap().current_stream_url = Some(url);
+                return ok_response(DaemonResponse::Ok);
+            }
+
             let prev_track = {
                 let mut s = state.lock().unwrap();
                 if s.queue.is_empty() {
@@ -783,6 +838,9 @@ fn handle_command(
         DaemonCommand::StreamPlaylist { url } => {
             handle_stream_request(url, true, state, stream_context, audio_tx)
         }
+        DaemonCommand::StreamQueueLoad { entries } => {
+            handle_stream_queue_load(entries, state, stream_context, audio_tx)
+        }
         DaemonCommand::SaveCurrentStream => {
             if !mpv_is_available() {
                 return error_response(
@@ -825,6 +883,70 @@ fn handle_stream_request(
     stream_context: &Arc<Mutex<StreamContext>>,
     audio_tx: &Sender<AudioCommand>,
 ) -> DaemonResponseEnvelope {
+    if let Some(response) = send_stream_command(audio_tx, url.clone()) {
+        return response;
+    }
+
+    {
+        let mut s = state.lock().unwrap();
+        s.queue.clear();
+        s.queue_index = 0;
+        s.stream_queue.clear();
+        s.stream_queue_index = 0;
+        s.is_streaming = true;
+    }
+    stream_context.lock().unwrap().current_stream_url = Some(url.clone());
+    if is_playlist {
+        info!(url = %url, "Streaming playlist via mpv");
+    } else {
+        info!(url = %url, "Streaming URL via mpv");
+    }
+    ok_response(DaemonResponse::Ok)
+}
+
+fn handle_stream_queue_load(
+    entries: Vec<StreamEntry>,
+    state: &Arc<Mutex<PlaybackState>>,
+    stream_context: &Arc<Mutex<StreamContext>>,
+    audio_tx: &Sender<AudioCommand>,
+) -> DaemonResponseEnvelope {
+    if !mpv_is_available() {
+        return error_response(
+            DaemonErrorCode::MpvUnavailable,
+            "mpv is not installed. Install mpv to use stream/save commands.".to_string(),
+        );
+    }
+
+    if entries.is_empty() {
+        return error_response(
+            DaemonErrorCode::TrackNotFound,
+            "Stream queue is empty".to_string(),
+        );
+    }
+
+    let first_url = entries[0].url.clone();
+
+    {
+        let mut s = state.lock().unwrap();
+        s.queue.clear();
+        s.queue_index = 0;
+        s.stream_queue = entries;
+        s.stream_queue_index = 0;
+        s.is_streaming = true;
+    }
+
+    if let Some(response) = send_stream_command(audio_tx, first_url.clone()) {
+        return response;
+    }
+
+    stream_context.lock().unwrap().current_stream_url = Some(first_url);
+    ok_response(DaemonResponse::Ok)
+}
+
+fn send_stream_command(
+    audio_tx: &Sender<AudioCommand>,
+    url: String,
+) -> Option<DaemonResponseEnvelope> {
     let (response_tx, response_rx) = mpsc::channel();
     if audio_tx
         .send(AudioCommand::Stream {
@@ -833,35 +955,22 @@ fn handle_stream_request(
         })
         .is_err()
     {
-        return error_response(
+        return Some(error_response(
             DaemonErrorCode::InternalError,
             "Audio thread not running".to_string(),
-        );
+        ));
     }
 
     match response_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Ok(())) => {
-            {
-                let mut s = state.lock().unwrap();
-                s.queue.clear();
-                s.queue_index = 0;
-            }
-            stream_context.lock().unwrap().current_stream_url = Some(url.clone());
-            if is_playlist {
-                info!(url = %url, "Streaming playlist via mpv");
-            } else {
-                info!(url = %url, "Streaming URL via mpv");
-            }
-            ok_response(DaemonResponse::Ok)
-        }
+        Ok(Ok(())) => None,
         Ok(Err(err)) => {
             let (code, message) = map_audio_error_to_daemon(err);
-            error_response(code, message)
+            Some(error_response(code, message))
         }
-        Err(_) => error_response(
+        Err(_) => Some(error_response(
             DaemonErrorCode::InternalError,
             "Timed out waiting for audio thread response".to_string(),
-        ),
+        )),
     }
 }
 

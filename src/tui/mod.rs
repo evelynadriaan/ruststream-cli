@@ -12,15 +12,34 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
 };
-use std::io;
+use serde_json::Value;
+use std::io::{self, Read};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::db::Database;
 use crate::download::{DownloadPhase, Downloader};
-use crate::ipc::DaemonClient;
-use crate::models::{PlaybackState, Track};
+use crate::ipc::{DaemonClient, DaemonResponse};
+use crate::models::{PlaybackState, StreamEntry, Track};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AppMode {
+    #[default]
+    Normal,
+    Search,
+    Edit,
+    AddUrl,
+    StreamUrl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LibraryView {
+    #[default]
+    Local,
+    StreamQueue,
+}
 
 enum DownloadUpdate {
     Status(String),
@@ -34,13 +53,11 @@ pub struct Tui {
     client: DaemonClient,
     tracks: Vec<Track>,
     library_state: ListState,
+    stream_queue_state: ListState,
     playback_state: PlaybackState,
-    search_query: String,
-    search_mode: bool,
-    edit_mode: bool,
-    edit_text: String,
-    add_mode: bool,
-    add_url: String,
+    mode: AppMode,
+    input_buf: String,
+    library_view: LibraryView,
     status_message: Option<String>,
     download_rx: Option<mpsc::Receiver<DownloadUpdate>>,
 }
@@ -61,19 +78,31 @@ impl Tui {
             library_state.select(Some(0));
         }
 
+        let library_view = if playback_state.is_streaming {
+            LibraryView::StreamQueue
+        } else {
+            LibraryView::Local
+        };
+
+        let mut stream_queue_state = ListState::default();
+        if !playback_state.stream_queue.is_empty() {
+            let idx = playback_state
+                .stream_queue_index
+                .min(playback_state.stream_queue.len() - 1);
+            stream_queue_state.select(Some(idx));
+        }
+
         Ok(Self {
             config,
             db,
             client,
             tracks,
             library_state,
+            stream_queue_state,
             playback_state,
-            search_query: String::new(),
-            search_mode: false,
-            edit_mode: false,
-            edit_text: String::new(),
-            add_mode: false,
-            add_url: String::new(),
+            mode: AppMode::Normal,
+            input_buf: String::new(),
+            library_view,
             status_message: None,
             download_rx: None,
         })
@@ -102,12 +131,16 @@ impl Tui {
     #[allow(clippy::collapsible_if)]
     fn main_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
+            let was_streaming = self.playback_state.is_streaming;
+
             // Refresh playback state
             if self.client.is_daemon_running() {
                 if let Ok(state) = self.client.get_status() {
                     self.playback_state = state;
                 }
             }
+
+            self.sync_library_view_with_streaming(was_streaming);
 
             // Poll for download progress updates
             if let Some(rx) = &self.download_rx {
@@ -166,84 +199,144 @@ impl Tui {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    if self.search_mode {
-                        match key.code {
+
+                    match self.mode {
+                        AppMode::Search => match key.code {
                             KeyCode::Esc => {
-                                self.search_mode = false;
-                                self.search_query.clear();
+                                self.mode = AppMode::Normal;
+                                self.input_buf.clear();
                             }
                             KeyCode::Enter => {
-                                self.search_mode = false;
+                                self.mode = AppMode::Normal;
                                 self.apply_search();
                             }
                             KeyCode::Backspace => {
-                                self.search_query.pop();
+                                self.input_buf.pop();
                             }
                             KeyCode::Char(c) => {
-                                self.search_query.push(c);
+                                self.input_buf.push(c);
                             }
                             _ => {}
-                        }
-                    } else if self.edit_mode {
-                        match key.code {
+                        },
+                        AppMode::Edit => match key.code {
                             KeyCode::Esc => {
-                                self.edit_mode = false;
-                                self.edit_text.clear();
+                                self.mode = AppMode::Normal;
+                                self.input_buf.clear();
                             }
                             KeyCode::Enter => {
-                                self.edit_mode = false;
+                                self.mode = AppMode::Normal;
                                 self.apply_edit();
                             }
                             KeyCode::Backspace => {
-                                self.edit_text.pop();
+                                self.input_buf.pop();
                             }
                             KeyCode::Char(c) => {
-                                self.edit_text.push(c);
+                                self.input_buf.push(c);
                             }
                             _ => {}
-                        }
-                    } else if self.add_mode {
-                        match key.code {
+                        },
+                        AppMode::AddUrl => match key.code {
                             KeyCode::Esc => {
-                                self.add_mode = false;
-                                self.add_url.clear();
+                                self.mode = AppMode::Normal;
+                                self.input_buf.clear();
                             }
                             KeyCode::Enter => {
-                                self.add_mode = false;
+                                self.mode = AppMode::Normal;
                                 self.add_track();
                             }
                             KeyCode::Backspace => {
-                                self.add_url.pop();
+                                self.input_buf.pop();
                             }
                             KeyCode::Char(c) => {
-                                self.add_url.push(c);
+                                self.input_buf.push(c);
                             }
                             _ => {}
-                        }
-                    } else {
-                        // Clear status message on any key press
-                        self.status_message = None;
-                        match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Char('/') => {
-                                self.search_mode = true;
+                        },
+                        AppMode::StreamUrl => match key.code {
+                            KeyCode::Esc => {
+                                self.mode = AppMode::Normal;
+                                self.input_buf.clear();
                             }
-                            KeyCode::Char('e') => self.start_edit(),
-                            KeyCode::Char('a') if self.download_rx.is_none() => {
-                                self.add_mode = true;
+                            KeyCode::Enter => {
+                                self.mode = AppMode::Normal;
+                                self.start_stream();
                             }
-                            KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
-                            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
-                            KeyCode::Left | KeyCode::Char('h') => self.seek_backward(),
-                            KeyCode::Right | KeyCode::Char('l') => self.seek_forward(),
-                            KeyCode::Enter => self.play_selected(),
-                            KeyCode::Char(' ') => self.toggle_or_play(),
-                            KeyCode::Char('+') | KeyCode::Char('=') => self.volume_up(),
-                            KeyCode::Char('-') => self.volume_down(),
+                            KeyCode::Backspace => {
+                                self.input_buf.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                self.input_buf.push(c);
+                            }
                             _ => {}
+                        },
+                        AppMode::Normal => {
+                            // Clear status message on any normal-mode key press
+                            self.status_message = None;
+                            match key.code {
+                                KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('/') => {
+                                    self.library_view = LibraryView::Local;
+                                    self.mode = AppMode::Search;
+                                    self.input_buf.clear();
+                                }
+                                KeyCode::Char('e') => self.start_edit(),
+                                KeyCode::Char('a') if self.download_rx.is_none() => {
+                                    self.library_view = LibraryView::Local;
+                                    self.mode = AppMode::AddUrl;
+                                    self.input_buf.clear();
+                                }
+                                KeyCode::Char('s') => {
+                                    self.mode = AppMode::StreamUrl;
+                                    self.input_buf.clear();
+                                }
+                                KeyCode::Char('l') => {
+                                    self.library_view = LibraryView::Local;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
+                                KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+                                KeyCode::Left | KeyCode::Char('h') => self.prev_or_seek_backward(),
+                                KeyCode::Right => self.next_or_seek_forward(),
+                                KeyCode::Enter => self.play_selected(),
+                                KeyCode::Char(' ') => self.toggle_or_play(),
+                                KeyCode::Char('+') | KeyCode::Char('=') => self.volume_up(),
+                                KeyCode::Char('-') => self.volume_down(),
+                                _ => {}
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn sync_library_view_with_streaming(&mut self, was_streaming: bool) {
+        if !was_streaming
+            && self.playback_state.is_streaming
+            && !self.playback_state.stream_queue.is_empty()
+        {
+            self.library_view = LibraryView::StreamQueue;
+            let idx = self
+                .playback_state
+                .stream_queue_index
+                .min(self.playback_state.stream_queue.len() - 1);
+            self.stream_queue_state.select(Some(idx));
+        }
+
+        if was_streaming && !self.playback_state.is_streaming {
+            self.library_view = LibraryView::Local;
+        }
+
+        if self.playback_state.stream_queue.is_empty() {
+            self.stream_queue_state.select(None);
+            return;
+        }
+
+        let len = self.playback_state.stream_queue.len();
+        match self.stream_queue_state.selected() {
+            Some(i) if i < len => {}
+            _ => {
+                let idx = self.playback_state.stream_queue_index.min(len - 1);
+                self.stream_queue_state.select(Some(idx));
             }
         }
     }
@@ -289,33 +382,60 @@ impl Tui {
                 ])
                 .split(inner);
 
+            let display_title = if self.playback_state.is_streaming {
+                self.playback_state
+                    .stream_queue
+                    .get(self.playback_state.stream_queue_index)
+                    .map(|entry| entry.title.as_str())
+                    .unwrap_or_else(|| track.display_name())
+            } else {
+                track.display_name()
+            };
+
             // Track title (centered, bold)
             let status_icon = if self.playback_state.is_playing {
                 "▶ "
             } else {
                 "⏸ "
             };
-            let title = Paragraph::new(Line::from(vec![
+            let mut title_spans = vec![
                 Span::styled(status_icon, Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    track.display_name(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-            ]))
-            .alignment(Alignment::Center);
+                Span::styled(display_title, Style::default().add_modifier(Modifier::BOLD)),
+            ];
+            if self.playback_state.is_streaming {
+                title_spans.push(Span::raw(" "));
+                title_spans.push(Span::styled(
+                    "[STREAMING]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+
+            let title = Paragraph::new(Line::from(title_spans)).alignment(Alignment::Center);
             f.render_widget(title, chunks[0]);
 
             // Progress bar
-            let progress = if track.duration > 0 {
-                (self.playback_state.position as f64 / track.duration as f64).min(1.0)
+            let gauge = if self.playback_state.is_streaming && track.duration == 0 {
+                Gauge::default()
+                    .ratio(1.0)
+                    .gauge_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
+                    .label(Span::styled(
+                        "▶ LIVE",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
             } else {
-                0.0
-            };
+                let progress = if track.duration > 0 {
+                    (self.playback_state.position as f64 / track.duration as f64).min(1.0)
+                } else {
+                    0.0
+                };
 
-            let gauge = Gauge::default()
-                .ratio(progress)
-                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-                .label("");
+                Gauge::default()
+                    .ratio(progress)
+                    .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+                    .label("")
+            };
             f.render_widget(gauge, chunks[2]);
 
             // Time display and controls
@@ -354,7 +474,13 @@ impl Tui {
     }
 
     fn render_main_content(&self, f: &mut Frame, area: Rect) {
-        // Library only
+        match self.library_view {
+            LibraryView::Local => self.render_local_library(f, area),
+            LibraryView::StreamQueue => self.render_stream_queue(f, area),
+        }
+    }
+
+    fn render_local_library(&self, f: &mut Frame, area: Rect) {
         let library_block = Block::default()
             .title(format!(" Library ({}) ", self.tracks.len()))
             .borders(Borders::ALL)
@@ -398,36 +524,87 @@ impl Tui {
         f.render_stateful_widget(list, area, &mut self.library_state.clone());
     }
 
+    fn render_stream_queue(&self, f: &mut Frame, area: Rect) {
+        let queue_len = self.playback_state.stream_queue.len();
+        let current_idx = self
+            .playback_state
+            .stream_queue_index
+            .min(queue_len.saturating_sub(1));
+
+        let block = Block::default()
+            .title(format!(
+                " Stream Queue ({}) - press l for Library ",
+                queue_len
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+
+        let items: Vec<ListItem> = self
+            .playback_state
+            .stream_queue
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let is_current = i == current_idx;
+                let prefix = if is_current { "♪ " } else { "  " };
+                let style = if is_current {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(format!("{}{}", prefix, entry.title)).style(style)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("▸ ");
+
+        f.render_stateful_widget(list, area, &mut self.stream_queue_state.clone());
+    }
+
     fn render_help(&self, f: &mut Frame, area: Rect) {
-        let (help_text, style) = if self.search_mode {
-            (
+        let (help_text, style) = match self.mode {
+            AppMode::Search => (
                 format!(
                     " Search: {}▌  (Enter to search, Esc to cancel)",
-                    self.search_query
+                    self.input_buf
                 ),
                 Style::default().fg(Color::DarkGray),
-            )
-        } else if self.edit_mode {
-            (
+            ),
+            AppMode::Edit => (
                 format!(
                     " Rename: {}▌  (Enter to save, Esc to cancel)",
-                    self.edit_text
+                    self.input_buf
                 ),
                 Style::default().fg(Color::DarkGray),
-            )
-        } else if self.add_mode {
-            (
-                format!(" Add URL: {}▌  (Enter to add, Esc to cancel)", self.add_url),
+            ),
+            AppMode::AddUrl => (
+                format!(
+                    " Add URL: {}▌  (Enter to add, Esc to cancel)",
+                    self.input_buf
+                ),
                 Style::default().fg(Color::DarkGray),
-            )
-        } else if let Some(ref msg) = self.status_message {
-            (format!(" {}", msg), Style::default().fg(Color::Yellow))
-        } else {
-            (
-                " q:Quit  /:Search  a:Add  e:Edit  ↑↓:Nav  ←→:Seek  Space:Play  +/-:Vol"
-                    .to_string(),
+            ),
+            AppMode::StreamUrl => (
+                format!(
+                    " Stream URL: {}▌  (Enter to stream, Esc to cancel)",
+                    self.input_buf
+                ),
                 Style::default().fg(Color::DarkGray),
-            )
+            ),
+            AppMode::Normal => {
+                if let Some(ref msg) = self.status_message {
+                    (format!(" {}", msg), Style::default().fg(Color::Yellow))
+                } else {
+                    (
+                        " q:Quit  /:Search  a:Add  s:Stream  e:Edit  l:Library  ↑↓:Nav  ←/h:Prev  →:Next/Seek  Space:Play  +/-:Vol"
+                            .to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                }
+            }
         };
 
         let help = Paragraph::new(help_text).style(style);
@@ -435,38 +612,80 @@ impl Tui {
     }
 
     fn select_next(&mut self) {
-        let len = self.tracks.len();
-        if len == 0 {
-            return;
-        }
+        match self.library_view {
+            LibraryView::Local => {
+                let len = self.tracks.len();
+                if len == 0 {
+                    return;
+                }
 
-        let i = match self.library_state.selected() {
-            Some(i) => (i + 1) % len,
-            None => 0,
-        };
-        self.library_state.select(Some(i));
+                let i = match self.library_state.selected() {
+                    Some(i) => (i + 1) % len,
+                    None => 0,
+                };
+                self.library_state.select(Some(i));
+            }
+            LibraryView::StreamQueue => {
+                let len = self.playback_state.stream_queue.len();
+                if len == 0 {
+                    return;
+                }
+
+                let i = match self.stream_queue_state.selected() {
+                    Some(i) => (i + 1) % len,
+                    None => 0,
+                };
+                self.stream_queue_state.select(Some(i));
+            }
+        }
     }
 
     fn select_prev(&mut self) {
-        let len = self.tracks.len();
-        if len == 0 {
-            return;
-        }
-
-        let i = match self.library_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    len - 1
-                } else {
-                    i - 1
+        match self.library_view {
+            LibraryView::Local => {
+                let len = self.tracks.len();
+                if len == 0 {
+                    return;
                 }
+
+                let i = match self.library_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            len - 1
+                        } else {
+                            i - 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.library_state.select(Some(i));
             }
-            None => 0,
-        };
-        self.library_state.select(Some(i));
+            LibraryView::StreamQueue => {
+                let len = self.playback_state.stream_queue.len();
+                if len == 0 {
+                    return;
+                }
+
+                let i = match self.stream_queue_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            len - 1
+                        } else {
+                            i - 1
+                        }
+                    }
+                    None => 0,
+                };
+                self.stream_queue_state.select(Some(i));
+            }
+        }
     }
 
     fn play_selected(&mut self) {
+        if self.library_view != LibraryView::Local {
+            return;
+        }
+
         let Some(i) = self.library_state.selected() else {
             return;
         };
@@ -516,7 +735,27 @@ impl Tui {
         }
     }
 
+    fn next_or_seek_forward(&mut self) {
+        if self.playback_state.is_streaming {
+            let _ = self.client.next();
+        } else {
+            self.seek_forward();
+        }
+    }
+
+    fn prev_or_seek_backward(&mut self) {
+        if self.playback_state.is_streaming {
+            let _ = self.client.previous();
+        } else {
+            self.seek_backward();
+        }
+    }
+
     fn start_edit(&mut self) {
+        if self.library_view != LibraryView::Local {
+            return;
+        }
+
         let Some(i) = self.library_state.selected() else {
             return;
         };
@@ -524,26 +763,31 @@ impl Tui {
             return;
         };
         // Pre-fill with current alias or title
-        self.edit_text = track.alias.clone().unwrap_or_else(|| track.title.clone());
-        self.edit_mode = true;
+        self.input_buf = track.alias.clone().unwrap_or_else(|| track.title.clone());
+        self.mode = AppMode::Edit;
     }
 
     fn apply_edit(&mut self) {
-        if self.edit_text.is_empty() {
+        if self.input_buf.is_empty() {
+            return;
+        }
+
+        if self.library_view != LibraryView::Local {
+            self.input_buf.clear();
             return;
         }
 
         let Some(i) = self.library_state.selected() else {
-            self.edit_text.clear();
+            self.input_buf.clear();
             return;
         };
         let Some(track) = self.tracks.get(i) else {
-            self.edit_text.clear();
+            self.input_buf.clear();
             return;
         };
 
         // Save the new alias to the database
-        let new_alias = self.edit_text.trim().to_string();
+        let new_alias = self.input_buf.trim().to_string();
         let alias = if new_alias == track.title {
             None // Clear alias if it matches the title
         } else {
@@ -557,12 +801,12 @@ impl Tui {
             }
         }
 
-        self.edit_text.clear();
+        self.input_buf.clear();
     }
 
     fn add_track(&mut self) {
-        let url = self.add_url.trim().to_string();
-        self.add_url.clear();
+        let url = self.input_buf.trim().to_string();
+        self.input_buf.clear();
 
         if url.is_empty() {
             return;
@@ -620,8 +864,58 @@ impl Tui {
         });
     }
 
+    fn start_stream(&mut self) {
+        let url = self.input_buf.trim().to_string();
+        self.input_buf.clear();
+
+        if url.is_empty() {
+            self.status_message = Some("Enter a YouTube URL".to_string());
+            return;
+        }
+
+        if !url.contains("youtube.com") && !url.contains("youtu.be") {
+            self.status_message = Some("Invalid URL - must be a YouTube URL".to_string());
+            return;
+        }
+
+        if url.contains("list=") {
+            let entries = match fetch_playlist_entries(&url) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    self.status_message = Some(format!("Playlist fetch failed: {}", e));
+                    return;
+                }
+            };
+
+            let entry_count = entries.len();
+            self.status_message =
+                Some(format!("Loading stream queue ({} entries)...", entry_count));
+
+            self.status_message = match self.client.stream_queue_load(entries) {
+                Ok(DaemonResponse::Ok) => {
+                    self.library_view = LibraryView::StreamQueue;
+                    Some(format!("Streaming playlist ({} entries)", entry_count))
+                }
+                Ok(DaemonResponse::Error { message, .. }) => {
+                    Some(format!("Stream queue failed: {}", message))
+                }
+                Ok(_) => Some("Unexpected daemon response".to_string()),
+                Err(e) => Some(format!("Stream queue failed: {}", e)),
+            };
+        } else {
+            self.status_message = match self.client.stream(url.clone()) {
+                Ok(DaemonResponse::Ok) => Some(format!("Streaming: {}", url)),
+                Ok(DaemonResponse::Error { message, .. }) => {
+                    Some(format!("Stream failed: {}", message))
+                }
+                Ok(_) => Some("Unexpected daemon response".to_string()),
+                Err(e) => Some(format!("Stream failed: {}", e)),
+            };
+        }
+    }
+
     fn apply_search(&mut self) {
-        if self.search_query.is_empty() {
+        if self.input_buf.is_empty() {
             return;
         }
 
@@ -629,7 +923,7 @@ impl Tui {
         use fuzzy_matcher::skim::SkimMatcherV2;
 
         let matcher = SkimMatcherV2::default();
-        let query = &self.search_query;
+        let query = &self.input_buf;
 
         let mut matches: Vec<_> = self
             .tracks
@@ -653,7 +947,106 @@ impl Tui {
             self.library_state.select(Some(*index));
         }
 
-        self.search_query.clear();
+        self.input_buf.clear();
+    }
+}
+
+fn fetch_playlist_entries(url: &str) -> std::result::Result<Vec<StreamEntry>, String> {
+    let mut child = Command::new("yt-dlp")
+        .args(["--flat-playlist", "--dump-json", url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    out.read_to_string(&mut stdout)
+                        .map_err(|e| format!("Failed to read yt-dlp output: {}", e))?;
+                }
+
+                let mut stderr = String::new();
+                if let Some(mut err) = child.stderr.take() {
+                    err.read_to_string(&mut stderr)
+                        .map_err(|e| format!("Failed to read yt-dlp stderr: {}", e))?;
+                }
+
+                if !status.success() {
+                    let err = stderr.trim();
+                    return Err(if err.is_empty() {
+                        "yt-dlp failed to resolve playlist".to_string()
+                    } else {
+                        format!("yt-dlp failed: {}", err)
+                    });
+                }
+
+                let mut entries = Vec::new();
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let json: Value = serde_json::from_str(line)
+                        .map_err(|e| format!("Failed to parse yt-dlp JSON line: {}", e))?;
+
+                    let title = json
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Untitled")
+                        .trim();
+
+                    let raw_url = json
+                        .get("webpage_url")
+                        .and_then(Value::as_str)
+                        .or_else(|| json.get("url").and_then(Value::as_str))
+                        .unwrap_or("")
+                        .trim();
+
+                    if raw_url.is_empty() {
+                        continue;
+                    }
+
+                    let resolved_url =
+                        if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                            raw_url.to_string()
+                        } else {
+                            format!("https://www.youtube.com/watch?v={}", raw_url)
+                        };
+
+                    entries.push(StreamEntry {
+                        title: if title.is_empty() {
+                            "Untitled".to_string()
+                        } else {
+                            title.to_string()
+                        },
+                        url: resolved_url,
+                    });
+                }
+
+                if entries.is_empty() {
+                    return Err("Playlist contains no playable entries".to_string());
+                }
+
+                return Ok(entries);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Timed out fetching playlist entries".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!("Failed while waiting for yt-dlp: {}", e));
+            }
+        }
     }
 }
 

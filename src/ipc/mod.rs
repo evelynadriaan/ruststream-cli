@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use crate::models::{PlaybackState, RepeatMode, Track};
+use crate::models::{PlaybackState, RepeatMode, StreamEntry, Track};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 const CONNECT_RETRIES: u8 = 4;
@@ -80,6 +80,9 @@ pub enum DaemonCommand {
     },
     StreamPlaylist {
         url: String,
+    },
+    StreamQueueLoad {
+        entries: Vec<StreamEntry>,
     },
     SaveCurrentStream,
     GetStatus,
@@ -279,6 +282,13 @@ impl DaemonClient {
 
     pub fn stream_playlist(&self, url: String) -> Result<DaemonResponse> {
         self.send_command(DaemonCommand::StreamPlaylist { url })
+    }
+
+    pub fn stream_queue_load(
+        &self,
+        entries: Vec<crate::models::StreamEntry>,
+    ) -> Result<DaemonResponse> {
+        self.send_command(DaemonCommand::StreamQueueLoad { entries })
     }
 
     pub fn save_current_stream(&self) -> Result<DaemonResponse> {

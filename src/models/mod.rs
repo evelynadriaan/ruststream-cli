@@ -64,6 +64,12 @@ pub struct PlaylistTrack {
     pub position: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamEntry {
+    pub title: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RepeatMode {
     #[default]
@@ -100,6 +106,9 @@ pub struct PlaybackState {
     pub current_track: Option<Track>,
     pub queue: Vec<Track>,
     pub queue_index: usize,
+    pub stream_queue: Vec<StreamEntry>,
+    pub stream_queue_index: usize,
+    pub is_streaming: bool,
     pub is_playing: bool,
     pub volume: u8,
     pub position: u64,
