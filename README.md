@@ -1,4 +1,4 @@
- # rustream-cli
+ # ruststream-cli
 
 A CLI tool for saving and playing YouTube audio from the terminal on Linux.
 
@@ -7,7 +7,7 @@ A CLI tool for saving and playing YouTube audio from the terminal on Linux.
 ```bash
 sudo apt-get update
 sudo apt-get install -y ffmpeg yt-dlp
-curl -fsSL https://raw.githubusercontent.com/SoItGoesIO/mixyt/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/evelynadriaan/ruststream-cli/main/install.sh | sh
 ```
 
 Detailed Linux install guide: `docs/install/linux.md`
