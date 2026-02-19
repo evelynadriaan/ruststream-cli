@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::download::{DownloadPhase, Downloader};
 use crate::ipc::{DaemonClient, DaemonResponse};
+use crate::lyrics::fetch_lyrics;
 use crate::models::{PlaybackState, StreamEntry, Track};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -63,7 +64,13 @@ pub struct Tui {
     input_buf: String,
     library_view: LibraryView,
     status_message: Option<String>,
+    lyrics: Option<Vec<String>>,
+    lyrics_visible: bool,
+    lyrics_scroll: usize,
+    last_track_id: Option<uuid::Uuid>,
+    lyrics_loading: bool,
     download_rx: Option<mpsc::Receiver<DownloadUpdate>>,
+    lyrics_rx: Option<mpsc::Receiver<Option<Vec<String>>>>,
 }
 
 impl Tui {
@@ -110,7 +117,13 @@ impl Tui {
             input_buf: String::new(),
             library_view,
             status_message: None,
+            lyrics: None,
+            lyrics_visible: false,
+            lyrics_scroll: 0,
+            last_track_id: None,
+            lyrics_loading: false,
             download_rx: None,
+            lyrics_rx: None,
         })
     }
 
@@ -147,6 +160,43 @@ impl Tui {
             }
 
             self.sync_library_view_with_streaming(was_streaming);
+
+            let current_track_id = self.playback_state.current_track.as_ref().map(|t| t.id);
+            if current_track_id != self.last_track_id {
+                self.last_track_id = current_track_id;
+                self.lyrics_scroll = 0;
+                self.lyrics = None;
+                self.lyrics_rx = None;
+
+                if let Some(track) = &self.playback_state.current_track {
+                    let title = track.title.clone();
+                    let (tx, rx) = mpsc::channel();
+                    self.lyrics_loading = true;
+                    self.lyrics_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let lines = fetch_lyrics(&title, "")
+                            .map(|lyrics| lyrics.lines().map(|line| line.to_string()).collect());
+                        let _ = tx.send(lines);
+                    });
+                } else {
+                    self.lyrics_loading = false;
+                }
+            }
+
+            if let Some(rx) = &self.lyrics_rx {
+                match rx.try_recv() {
+                    Ok(lines) => {
+                        self.lyrics = lines;
+                        self.lyrics_loading = false;
+                        self.lyrics_rx = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.lyrics_loading = false;
+                        self.lyrics_rx = None;
+                    }
+                }
+            }
 
             // Poll for download progress updates
             if let Some(rx) = &self.download_rx {
@@ -330,14 +380,31 @@ impl Tui {
                                 KeyCode::Char('l') => {
                                     self.library_view = LibraryView::Local;
                                 }
+                                KeyCode::Char('L') => {
+                                    self.lyrics_visible = !self.lyrics_visible;
+                                }
                                 KeyCode::Char('d') | KeyCode::Delete => {
                                     self.remove_selected_track();
                                 }
                                 KeyCode::Char('S') if self.playback_state.is_streaming => {
                                     self.save_current_stream_shortcut();
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
-                                KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+                                KeyCode::Up => {
+                                    if self.lyrics_visible {
+                                        self.scroll_lyrics_up();
+                                    } else {
+                                        self.select_prev();
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if self.lyrics_visible {
+                                        self.scroll_lyrics_down();
+                                    } else {
+                                        self.select_next();
+                                    }
+                                }
+                                KeyCode::Char('k') => self.select_prev(),
+                                KeyCode::Char('j') => self.select_next(),
                                 KeyCode::Left | KeyCode::Char('h') => self.prev_or_seek_backward(),
                                 KeyCode::Right => self.next_or_seek_forward(),
                                 KeyCode::Enter if self.library_view == LibraryView::YtResults => {
@@ -399,7 +466,16 @@ impl Tui {
             .split(f.area());
 
         self.render_now_playing(f, chunks[0]);
-        self.render_main_content(f, chunks[1]);
+        if self.lyrics_visible {
+            let main_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(chunks[1]);
+            self.render_main_content(f, main_chunks[0]);
+            self.render_lyrics(f, main_chunks[1]);
+        } else {
+            self.render_main_content(f, chunks[1]);
+        }
         self.render_help(f, chunks[2]);
     }
 
@@ -681,7 +757,7 @@ impl Tui {
                     };
                     (
                         format!(
-                            " q:Quit  /:Search  a:Add  s:Stream  e:Edit  d:Remove  l:Library{}  ↑↓:Nav  ←/h:Prev  →:Next/Seek  Space:Play  +/-:Vol",
+                            " q:Quit  /:Search  a:Add  s:Stream  e:Edit  d:Remove  l:Library{}  L:Lyrics  ↑↓:Nav/Scroll  ←/h:Prev  →:Next/Seek  Space:Play  +/-:Vol",
                             save_stream_hint
                         ),
                         Style::default().fg(Color::DarkGray),
@@ -1188,6 +1264,37 @@ impl Tui {
         }
 
         self.input_buf.clear();
+    }
+
+    fn render_lyrics(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(" Lyrics  (↑↓ to scroll, L to close) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green));
+
+        let text = match &self.lyrics {
+            Some(lines) if !lines.is_empty() => lines.join("\n"),
+            _ if self.lyrics_loading => "Fetching lyrics…".to_string(),
+            _ => "No lyrics found".to_string(),
+        };
+
+        let para = Paragraph::new(text)
+            .block(block)
+            .scroll((self.lyrics_scroll as u16, 0));
+        f.render_widget(para, area);
+    }
+
+    fn scroll_lyrics_up(&mut self) {
+        self.lyrics_scroll = self.lyrics_scroll.saturating_sub(1);
+    }
+
+    fn scroll_lyrics_down(&mut self) {
+        let max_scroll = self
+            .lyrics
+            .as_ref()
+            .map(|lines| lines.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.lyrics_scroll = (self.lyrics_scroll + 1).min(max_scroll);
     }
 }
 

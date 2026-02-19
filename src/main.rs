@@ -5,6 +5,7 @@ mod daemon;
 mod db;
 mod download;
 mod ipc;
+mod lyrics;
 mod models;
 mod tui;
 

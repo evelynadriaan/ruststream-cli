@@ -5,5 +5,6 @@ pub mod daemon;
 pub mod db;
 pub mod download;
 pub mod ipc;
+pub mod lyrics;
 pub mod models;
 pub mod tui;
