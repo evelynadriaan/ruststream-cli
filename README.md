@@ -35,6 +35,7 @@ Browser tabs accumulate. Streaming services shuffle catalogues. This tool solves
 - **Daemon architecture** — background playback engine with Unix socket IPC; survives terminal close
 - **Linux media key integration** — MPRIS/D-Bus support for system media keys and lock screen controls
 - **Local listen history** — every play logged to SQLite; view with `clistream history`
+- **Discord Rich Presence** — opt-in: shows currently playing in Discord status (`discord_rich_presence = true` in config)
 
 ---
 

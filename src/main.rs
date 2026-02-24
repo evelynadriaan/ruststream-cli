@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod daemon;
 mod db;
+mod discord;
 mod download;
 mod ipc;
 mod lyrics;

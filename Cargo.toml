@@ -49,6 +49,7 @@ interprocess = "2"
 
 # Media controls (system media keys)
 souvlaki = "0.7"
+discord-rich-presence = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

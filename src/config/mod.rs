@@ -20,11 +20,16 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub config_version: u32,
+    #[serde(default)]
+    pub discord_rich_presence: bool,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { config_version: 1 }
+        Self {
+            config_version: 1,
+            discord_rich_presence: false,
+        }
     }
 }
 

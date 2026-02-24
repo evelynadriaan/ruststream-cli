@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod discord;
 pub mod download;
 pub mod ipc;
 pub mod lyrics;

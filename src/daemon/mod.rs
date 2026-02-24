@@ -3,7 +3,7 @@ use chrono::Utc;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::{debug, error, info, warn};
@@ -13,6 +13,7 @@ use crate::audio::{
 };
 use crate::config::Config;
 use crate::db::Database;
+use crate::discord::PresenceUpdate;
 use crate::download::Downloader;
 use crate::ipc::{
     DaemonCommand, DaemonErrorCode, DaemonRequestEnvelope, DaemonResponse, DaemonResponseEnvelope,
@@ -148,6 +149,16 @@ impl Daemon {
 
         let running = Arc::new(AtomicBool::new(true));
 
+        // Discord Rich Presence (optional)
+        let discord_tx: Option<SyncSender<PresenceUpdate>> =
+            if self.config.app.discord_rich_presence {
+                let (tx, rx) = mpsc::sync_channel(4);
+                thread::spawn(move || crate::discord::run(rx));
+                Some(tx)
+            } else {
+                None
+            };
+
         // Create channel for audio commands
         let (audio_tx, audio_rx): (Sender<AudioCommand>, Receiver<AudioCommand>) = mpsc::channel();
 
@@ -156,6 +167,7 @@ impl Daemon {
         let audio_state = Arc::clone(&state);
         let default_volume = self.config.playback.default_volume;
         let audio_config = self.config.clone();
+        let audio_discord_tx = discord_tx.clone();
         thread::spawn(move || {
             run_audio_thread(
                 audio_rx,
@@ -163,6 +175,7 @@ impl Daemon {
                 audio_running,
                 default_volume,
                 audio_config,
+                audio_discord_tx,
             );
         });
 
@@ -172,6 +185,7 @@ impl Daemon {
         let monitor_audio_tx = audio_tx.clone();
         let monitor_stream_context = Arc::clone(&stream_context);
         let monitor_db_path = self.config.db_path();
+        let monitor_discord_tx = discord_tx.clone();
         thread::spawn(move || {
             playback_monitor(
                 monitor_state,
@@ -179,6 +193,7 @@ impl Daemon {
                 monitor_running,
                 monitor_audio_tx,
                 monitor_db_path,
+                monitor_discord_tx,
             );
         });
 
@@ -209,6 +224,7 @@ impl Daemon {
                         &running,
                         &audio_tx,
                         &self.config,
+                        &discord_tx,
                     );
 
                     if let Err(e) = response {
@@ -223,6 +239,7 @@ impl Daemon {
             }
         }
 
+        send_presence_update(&discord_tx, PresenceUpdate::Stopped);
         cleanup_runtime_files(&self.config);
 
         info!("Daemon stopped");
@@ -402,6 +419,7 @@ fn run_audio_thread(
     running: Arc<AtomicBool>,
     default_volume: u8,
     config: Config,
+    discord_tx: Option<SyncSender<PresenceUpdate>>,
 ) {
     let create_rodio_backend = |volume: u8| -> Box<dyn PlaybackBackend> {
         match RodioBackend::new() {
@@ -440,11 +458,16 @@ fn run_audio_thread(
 
                     if let Err(e) = backend.play(&track.file_path) {
                         error!(error = %e, file_path = %track.file_path, "Failed to play track");
-                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Error);
+                        apply_playback_transition(
+                            &mut state.lock().unwrap(),
+                            PlaybackEvent::Error,
+                            &discord_tx,
+                        );
                     } else {
                         apply_playback_transition(
                             &mut state.lock().unwrap(),
                             PlaybackEvent::Start(track),
+                            &discord_tx,
                         );
                     }
                 }
@@ -460,6 +483,7 @@ fn run_audio_thread(
                             apply_playback_transition(
                                 &mut state.lock().unwrap(),
                                 PlaybackEvent::Start(stream_track(&url)),
+                                &discord_tx,
                             );
                             Ok(())
                         }
@@ -468,6 +492,7 @@ fn run_audio_thread(
                             apply_playback_transition(
                                 &mut state.lock().unwrap(),
                                 PlaybackEvent::Error,
+                                &discord_tx,
                             );
                             Err(e)
                         }
@@ -478,7 +503,11 @@ fn run_audio_thread(
                     if let Err(e) = backend.pause() {
                         error!(error = %e, "Pause failed on active backend");
                     } else {
-                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Pause);
+                        apply_playback_transition(
+                            &mut state.lock().unwrap(),
+                            PlaybackEvent::Pause,
+                            &discord_tx,
+                        );
                     }
                 }
                 AudioCommand::Resume => {
@@ -488,6 +517,7 @@ fn run_audio_thread(
                         apply_playback_transition(
                             &mut state.lock().unwrap(),
                             PlaybackEvent::Resume,
+                            &discord_tx,
                         );
                     }
                 }
@@ -495,7 +525,11 @@ fn run_audio_thread(
                     if let Err(e) = backend.stop() {
                         error!(error = %e, "Stop failed on active backend");
                     }
-                    apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Stop);
+                    apply_playback_transition(
+                        &mut state.lock().unwrap(),
+                        PlaybackEvent::Stop,
+                        &discord_tx,
+                    );
                 }
                 AudioCommand::SetVolume(vol) => {
                     current_volume = vol;
@@ -549,6 +583,7 @@ fn playback_monitor(
     running: Arc<AtomicBool>,
     audio_tx: Sender<AudioCommand>,
     db_path: std::path::PathBuf,
+    discord_tx: Option<SyncSender<PresenceUpdate>>,
 ) {
     let db = match Database::open(&db_path) {
         Ok(db) => Some(db),
@@ -640,7 +675,11 @@ fn playback_monitor(
             match action {
                 FinishAction::PlayTrack(track) => {
                     if audio_tx.send(AudioCommand::Play(track)).is_err() {
-                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Error);
+                        apply_playback_transition(
+                            &mut state.lock().unwrap(),
+                            PlaybackEvent::Error,
+                            &discord_tx,
+                        );
                     }
                 }
                 FinishAction::StreamUrl(url) => {
@@ -652,7 +691,11 @@ fn playback_monitor(
                         })
                         .is_err()
                     {
-                        apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Error);
+                        apply_playback_transition(
+                            &mut state.lock().unwrap(),
+                            PlaybackEvent::Error,
+                            &discord_tx,
+                        );
                         continue;
                     }
 
@@ -665,6 +708,7 @@ fn playback_monitor(
                             apply_playback_transition(
                                 &mut state.lock().unwrap(),
                                 PlaybackEvent::Error,
+                                &discord_tx,
                             );
                         }
                         Err(e) => {
@@ -672,12 +716,17 @@ fn playback_monitor(
                             apply_playback_transition(
                                 &mut state.lock().unwrap(),
                                 PlaybackEvent::Error,
+                                &discord_tx,
                             );
                         }
                     }
                 }
                 FinishAction::Stop => {
-                    apply_playback_transition(&mut state.lock().unwrap(), PlaybackEvent::Finished);
+                    apply_playback_transition(
+                        &mut state.lock().unwrap(),
+                        PlaybackEvent::Finished,
+                        &discord_tx,
+                    );
                 }
             }
         }
@@ -745,6 +794,7 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     audio_tx: &Sender<AudioCommand>,
     config: &Config,
+    discord_tx: &Option<SyncSender<PresenceUpdate>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(&conn);
     let mut writer = &conn;
@@ -770,6 +820,7 @@ fn handle_connection(
                     running,
                     audio_tx,
                     config,
+                    discord_tx,
                 )
             }
         }
@@ -793,6 +844,7 @@ fn handle_command(
     running: &Arc<AtomicBool>,
     audio_tx: &Sender<AudioCommand>,
     config: &Config,
+    discord_tx: &Option<SyncSender<PresenceUpdate>>,
 ) -> DaemonResponseEnvelope {
     match command {
         DaemonCommand::Play { track } => {
@@ -907,8 +959,7 @@ fn handle_command(
                     };
 
                     if !s.shuffle && next_idx == 0 && s.repeat == RepeatMode::Off {
-                        s.is_playing = false;
-                        s.current_track = None;
+                        apply_playback_transition(&mut s, PlaybackEvent::Stop, discord_tx);
                         return ok_response(DaemonResponse::Ok);
                     }
 
@@ -1218,25 +1269,57 @@ fn derive_playback_lifecycle(state: &PlaybackState) -> PlaybackLifecycle {
     }
 }
 
-fn apply_playback_transition(state: &mut PlaybackState, event: PlaybackEvent) {
+fn send_presence_update(discord_tx: &Option<SyncSender<PresenceUpdate>>, update: PresenceUpdate) {
+    let Some(tx) = discord_tx else {
+        return;
+    };
+
+    if let Err(err) = tx.try_send(update) {
+        debug!(?err, "Dropped Discord presence update");
+    }
+}
+
+fn apply_playback_transition(
+    state: &mut PlaybackState,
+    event: PlaybackEvent,
+    discord_tx: &Option<SyncSender<PresenceUpdate>>,
+) {
     let current = derive_playback_lifecycle(state);
+    let mut presence_update: Option<PresenceUpdate> = None;
 
     match (current, event) {
         (_, PlaybackEvent::Stop | PlaybackEvent::Finished | PlaybackEvent::Error) => {
             state.is_playing = false;
             state.current_track = None;
             state.position = 0;
+            presence_update = Some(PresenceUpdate::Stopped);
         }
         (_, PlaybackEvent::Start(track)) => {
+            let title = track.display_name().to_string();
             state.current_track = Some(track);
             state.is_playing = true;
             state.position = 0;
+            presence_update = Some(PresenceUpdate::Playing {
+                title,
+                artist: None,
+            });
         }
         (PlaybackLifecycle::Playing, PlaybackEvent::Pause) => {
             state.is_playing = false;
+            if let Some(track) = state.current_track.as_ref() {
+                presence_update = Some(PresenceUpdate::Paused {
+                    title: track.display_name().to_string(),
+                });
+            }
         }
         (PlaybackLifecycle::Paused, PlaybackEvent::Resume) => {
             state.is_playing = true;
+            if let Some(track) = state.current_track.as_ref() {
+                presence_update = Some(PresenceUpdate::Playing {
+                    title: track.display_name().to_string(),
+                    artist: None,
+                });
+            }
         }
         (PlaybackLifecycle::Stopped, PlaybackEvent::Pause | PlaybackEvent::Resume) => {
             warn!(lifecycle = ?current, "Ignoring invalid playback transition on stopped state");
@@ -1247,6 +1330,10 @@ fn apply_playback_transition(state: &mut PlaybackState, event: PlaybackEvent) {
         (PlaybackLifecycle::Paused, PlaybackEvent::Pause) => {
             debug!("Playback already in Paused state");
         }
+    }
+
+    if let Some(update) = presence_update {
+        send_presence_update(discord_tx, update);
     }
 }
 

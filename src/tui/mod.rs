@@ -1311,12 +1311,10 @@ fn fetch_yt_search_results_with_command(
     query: &str,
 ) -> std::result::Result<Vec<StreamEntry>, String> {
     let yt_query = format!("ytsearch10:{}", query);
-    let mut child = Command::new(command)
-        .args([yt_query.as_str(), "--flat-playlist", "--dump-json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+    let mut child = spawn_yt_dlp_with_retry(
+        command,
+        &[yt_query.as_str(), "--flat-playlist", "--dump-json"],
+    )?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
 
@@ -1369,12 +1367,7 @@ pub fn fetch_playlist_entries_with_command(
     command: &str,
     url: &str,
 ) -> std::result::Result<Vec<StreamEntry>, String> {
-    let mut child = Command::new(command)
-        .args(["--flat-playlist", "--dump-json", url])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+    let mut child = spawn_yt_dlp_with_retry(command, &["--flat-playlist", "--dump-json", url])?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
 
@@ -1468,6 +1461,29 @@ fn parse_playlist_entries_lines(stdout: &str) -> std::result::Result<Vec<StreamE
     }
 
     Ok(entries)
+}
+
+fn spawn_yt_dlp_with_retry(
+    command: &str,
+    args: &[&str],
+) -> std::result::Result<std::process::Child, String> {
+    const ETXTBSY: i32 = 26;
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    loop {
+        match Command::new(command)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(err) if err.raw_os_error() == Some(ETXTBSY) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => return Err(format!("Failed to run yt-dlp: {}", err)),
+        }
+    }
 }
 
 pub fn run(config: Config, db: Database) -> Result<()> {
