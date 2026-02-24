@@ -6,7 +6,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [1.2.0] — 2026-02-24
 
 ### Added
 - Optional Discord Rich Presence support — set `discord_rich_presence = true` in `~/.config/clistream/config.toml` to enable
